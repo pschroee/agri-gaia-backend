@@ -6,6 +6,7 @@
 # SPDX-FileContributor: Maik Fruhner
 # SPDX-FileContributor: Prof. Dr.-Ing. Heiko Tapken
 # SPDX-FileContributor: Tobias Wamhof
+# SPDX-FileContributor: Philipp Schröer
 #
 # SPDX-License-Identifier: MIT
 
@@ -39,8 +40,8 @@ COPY --from=docker/buildx-bin:latest /buildx /usr/local/lib/docker/cli-plugins/d
 
 COPY --from=backend_binaries nuctl /usr/local/bin
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade --timeout 120 --retries 5 -r /code/requirements.txt
+COPY requirements.txt constraints.txt ./
+RUN pip install --no-cache-dir --upgrade --timeout 120 --retries 5 -r /code/requirements.txt -c /code/constraints.txt
 
 COPY . .
 ARG KEYCLOAK_REALM_NAME
