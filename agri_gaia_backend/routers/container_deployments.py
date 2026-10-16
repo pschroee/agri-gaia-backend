@@ -6,6 +6,7 @@
 # SPDX-FileContributor: Maik Fruhner
 # SPDX-FileContributor: Prof. Dr.-Ing. Heiko Tapken
 # SPDX-FileContributor: Tobias Wamhof
+# SPDX-FileContributor: Philipp Schröer
 #
 # SPDX-License-Identifier: MIT
 
@@ -172,7 +173,7 @@ def undeploy_container(
         sql_edge_device_api.get_edge_device(db, container_deployment.edge_device_id)
     )
 
-    def undeploy_task(container_deployment_id: int, **kwargs):
+    def undeploy_task(container_deployment_id: int, on_error, **kwargs):
         container_deployment: ContainerDeployment = check_exists(
             sql_api.get_container_deployment(db, container_deployment_id)
         )
@@ -180,7 +181,14 @@ def undeploy_container(
         edge_device: EdgeDevice = check_exists(
             sql_edge_device_api.get_edge_device(db, container_deployment.edge_device_id)
         )
-        portainer.undeploy_container_from_edge_device(edge_device, container_deployment)
+        try:
+            portainer.undeploy_container_from_edge_device(
+                edge_device, container_deployment
+            )
+        except HTTPException as e:
+            # keep the deployment, but tell the user why it could not be removed
+            on_error(str(e.detail))
+            raise
 
         # update the deployment status in db
         container_deployment.status = ContainerDeploymentStatus.undeployed
