@@ -8,6 +8,7 @@
 # SPDX-FileContributor: Maik Fruhner
 # SPDX-FileContributor: Prof. Dr.-Ing. Heiko Tapken
 # SPDX-FileContributor: Tobias Wamhof
+# SPDX-FileContributor: Philipp Schröer
 #
 # SPDX-License-Identifier: MIT
 
@@ -73,6 +74,33 @@ def _update_edge_key(endpoint: dict):
         base64.b64encode(edge_key.encode("utf-8")).decode("utf-8").replace("=", "")
     )
     endpoint["EdgeKey"] = edge_key_encoded
+
+
+def _error_message_from_response(response: requests.Response) -> str:
+    """Builds an error message from a Portainer response.
+
+    Docker answers a successful container removal with 204 and an empty body, and Portainer sends a
+    JSON body with a 'message' only on error. Never rely on that body: a request for an edge device
+    whose agent is not connected is answered with 502 and an empty body.
+    """
+    if response.content:
+        try:
+            body = response.json()
+        except ValueError:
+            body = None
+        if isinstance(body, dict) and body.get("message"):
+            return str(body["message"])
+
+    detail = response.text.strip()
+    if detail:
+        if len(detail) > 500:
+            detail = detail[:500] + "..."
+        return f"Portainer returned HTTP {response.status_code}: {detail}"
+
+    return (
+        f"Portainer returned HTTP {response.status_code} with an empty body "
+        "(the agent of the edge device is probably not connected)"
+    )
 
 
 class PortainerAPI:
@@ -523,6 +551,8 @@ class PortainerAPI:
     def undeploy_container_from_edge_device(
         self, edge_device: EdgeDevice, container_deployment: ContainerDeployment
     ):
+        self._login_if_needed()
+
         response = requests.delete(
             url=f"{PORTAINER_API_URL}/endpoints/{edge_device.portainer_id}/docker/containers/{container_deployment.docker_container_id}",
             verify=VERIFY_SSL,
@@ -532,11 +562,12 @@ class PortainerAPI:
 
         # if we try to delete a non existing container deployment, it was likely deleted manually (outside of the platform)
         # just ignore this case and return True
+        # a successful removal is 204 with an empty body, so the status alone decides about success
         if response.ok or response.status_code == requests.codes.not_found:
             return True
 
-        msg = response.json()["message"]
-        logger.debug(msg)
+        msg = _error_message_from_response(response)
+        logger.error(msg)
         raise HTTPException(400, msg)
 
     ### TAGS
