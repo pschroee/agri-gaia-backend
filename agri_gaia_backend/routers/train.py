@@ -64,6 +64,8 @@ from agri_gaia_backend.util.train import (
     uninstall_template,
     get_onnx_model_filepath,
     read_from_container,
+    read_train_container_files,
+    write_train_container_files,
     get_config_with_schema,
     get_export_schema_filepath,
     update_train_container_config,
@@ -186,6 +188,16 @@ def build_train_image(
             score_name=score_name,
             score_regexp=score_regexp,
         )
+
+        # Warm the image on the host while no user token is involved. The run
+        # task only has the user's access token, which lives 300 s, and a cold
+        # pull takes minutes; pulling here keeps the token valid until the
+        # container starts. A failure must not fail the build: the run task
+        # pulls as a fallback.
+        try:
+            pull_image_if_missing(image_id)
+        except Exception as e:
+            logger.error(f"Unable to pull train image '{image_id}' to the host: {e}")
     except HTTPException as e:
         error_msg = str(e.detail)
         logger.error(error_msg)
@@ -204,6 +216,19 @@ async def run_train_container(
     task_creator: TaskCreator = Depends(get_task_creator),
 ) -> Response:
     user: KeycloakUser = request.user
+
+    train_container = check_exists(
+        sql_api.get_train_container(db, train_container_id)
+    )
+    if (
+        train_container.container_id is not None
+        and container_exists(train_container.container_id)
+        and get_container(train_container.container_id).status == "running"
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Train Container #{train_container_id} is already running.",
+        )
 
     def _run_train_container(
         on_error,
@@ -239,7 +264,20 @@ async def run_train_container(
             # from an earlier run still carries the token of that run.
             pull_image_if_missing(train_container.image_id)
 
+            # Configuration edits and trained models live only in the old
+            # container's filesystem. Keep them across the recreation.
+            preserved_files = {}
             if train_container.container_id is not None:
+                preserved_files = read_train_container_files(
+                    container_id=train_container.container_id,
+                    templates_path=TEMPLATES_PATH,
+                    provider=train_container.provider,
+                    architecture=train_container.architecture,
+                    extra_filepaths=(
+                        train_container.model_filepath,
+                        get_onnx_model_filepath(train_container.model_filepath),
+                    ),
+                )
                 remove_container(train_container.container_id, force=True)
                 train_container.container_id = None
                 sql_api.update_train_container(db, train_container)
@@ -257,7 +295,6 @@ async def run_train_container(
                 "cap_add": ["SYS_ADMIN"],
                 "devices": ["/dev/fuse:/dev/fuse"],
                 "detach": True,
-                "remove": False,
                 "ipc_mode": "host",
                 "ulimits": [
                     Ulimit(name="memlock", soft=-1, hard=-1),
@@ -289,7 +326,9 @@ async def run_train_container(
                 run_parameters["device_requests"] = [gpu_device_request]
                 run_parameters["environment"]["NVIDIA_VISIBLE_DEVICES"] = "all"
 
-            container = docker_host_client.containers.run(**run_parameters)
+            container = docker_host_client.containers.create(**run_parameters)
+            write_train_container_files(container.id, preserved_files)
+            container.start()
             train_container.container_id = container.id
 
             train_container.score = None
