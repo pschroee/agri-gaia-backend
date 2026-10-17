@@ -215,6 +215,19 @@ async def run_train_container(
 ) -> Response:
     user: KeycloakUser = request.user
 
+    train_container = check_exists(
+        sql_api.get_train_container(db, train_container_id)
+    )
+    if (
+        train_container.container_id is not None
+        and container_exists(train_container.container_id)
+        and get_container(train_container.container_id).status == "running"
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Train Container #{train_container_id} is already running.",
+        )
+
     def _run_train_container(
         on_error,
         on_progress_change,
