@@ -186,6 +186,16 @@ def build_train_image(
             score_name=score_name,
             score_regexp=score_regexp,
         )
+
+        # Warm the image on the host while no user token is involved. The run
+        # task only has the user's access token, which lives 300 s, and a cold
+        # pull takes minutes; pulling here keeps the token valid until the
+        # container starts. A failure must not fail the build: the run task
+        # pulls as a fallback.
+        try:
+            pull_image_if_missing(image_id)
+        except Exception as e:
+            logger.error(f"Unable to pull train image '{image_id}' to the host: {e}")
     except HTTPException as e:
         error_msg = str(e.detail)
         logger.error(error_msg)
