@@ -405,6 +405,61 @@ def read_from_container(container_id: str, container_filepath: str) -> bytes:
             return fh.read()
 
 
+def read_train_container_files(
+    container_id: str,
+    templates_path: str,
+    provider: str,
+    architecture: str,
+    extra_filepaths: Tuple[str, ...] = (),
+) -> Dict[str, bytes]:
+    """Collects the files a user can change inside a train container.
+
+    The run task recreates the container to give it a fresh access token.
+    Configuration edits (train_config.json, export_config.json, .env) and
+    trained model files live only in the container filesystem, so they have to
+    survive that recreation. Missing files are skipped.
+    """
+    filepaths = {
+        str(
+            get_config_container_filepath(
+                TRAIN_CONFIG_FILENAME, templates_path, provider, architecture
+            )
+        ),
+        str(
+            get_config_container_filepath(
+                EXPORT_CONFIG_FILENAME, templates_path, provider, architecture
+            )
+        ),
+        str(get_env_container_filepath(templates_path, provider, architecture)),
+        *extra_filepaths,
+    }
+
+    files = {}
+    for filepath in filepaths:
+        try:
+            data = read_from_container(container_id, filepath)
+        except Exception as e:
+            logger.warning(f"Unable to read '{filepath}' from container: {e}")
+            continue
+        if data is not None:
+            files[filepath] = data
+    return files
+
+
+def write_train_container_files(container_id: str, files: Dict[str, bytes]) -> None:
+    """Writes files collected by read_train_container_files into a container."""
+    for container_filepath, data in files.items():
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            src = os.path.join(tmp_dir, os.path.basename(container_filepath))
+            with open(src, "wb") as fh:
+                fh.write(data)
+            write_to_container(
+                container_id=container_id,
+                container_path=os.path.dirname(container_filepath),
+                src=src,
+            )
+
+
 def tar_compress(src_path: str) -> bytes:
     with tempfile.TemporaryDirectory() as tmp_dir:
         output_filepath = os.path.join(tmp_dir, "archive.tar")
