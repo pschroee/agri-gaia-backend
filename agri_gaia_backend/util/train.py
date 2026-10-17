@@ -13,6 +13,7 @@
 
 # -*- coding: utf-8 -*-
 
+import io
 import os
 import json
 import tarfile
@@ -447,17 +448,42 @@ def read_train_container_files(
 
 
 def write_train_container_files(container_id: str, files: Dict[str, bytes]) -> None:
-    """Writes files collected by read_train_container_files into a container."""
-    for container_filepath, data in files.items():
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            src = os.path.join(tmp_dir, os.path.basename(container_filepath))
-            with open(src, "wb") as fh:
-                fh.write(data)
-            write_to_container(
-                container_id=container_id,
-                container_path=os.path.dirname(container_filepath),
-                src=src,
-            )
+    """Writes files collected by read_train_container_files into a container.
+
+    Uses the archive API instead of `docker cp`: directories such as /train are
+    created by the training run, so they do not exist in a fresh container and
+    `docker cp` would create a file named /train instead of the directory.
+    """
+    if not files:
+        return
+
+    container = get_container(container_id)
+    directories = set()
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as tar:
+        for container_filepath, data in files.items():
+            name = container_filepath.lstrip("/")
+
+            parent = os.path.dirname(name)
+            parents = []
+            while parent:
+                parents.append(parent)
+                parent = os.path.dirname(parent)
+            for directory in reversed(parents):
+                if directory in directories:
+                    continue
+                directories.add(directory)
+                info = tarfile.TarInfo(name=directory)
+                info.type = tarfile.DIRTYPE
+                info.mode = 0o755
+                tar.addfile(info)
+
+            info = tarfile.TarInfo(name=name)
+            info.size = len(data)
+            info.mode = 0o644
+            tar.addfile(info, io.BytesIO(data))
+
+    container.put_archive("/", buffer.getvalue())
 
 
 def tar_compress(src_path: str) -> bytes:
