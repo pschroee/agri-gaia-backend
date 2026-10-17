@@ -180,6 +180,20 @@ def image_exists(image_name: str, where: str = "platform") -> Optional[bool]:
     return any(images)
 
 
+def pull_image_if_missing(image_name: str) -> None:
+    """Pulls a train container image to the host if it is not present yet.
+
+    Pulling a cold image can take several minutes. Values written into the
+    container environment at creation time, such as an OIDC access token, must
+    therefore be gathered only after this call returned.
+    """
+    try:
+        docker_host_client.images.get(image_name)
+    except docker.errors.ImageNotFound:
+        print("Pulling train container image to host:", image_name)
+        docker_host_client.images.pull(image_name)
+
+
 def remove_container(container_id: str, force: bool = False) -> None:
     try:
         if container_exists(container_id):

@@ -47,10 +47,12 @@ from agri_gaia_backend.schemas.train_container import TrainContainer
 from agri_gaia_backend.services.docker import image_builder
 from agri_gaia_backend.services.docker.client import host_client as docker_host_client
 from agri_gaia_backend.util.train import (
+    container_exists,
     get_config_filepath,
     get_config_filepaths,
     get_container,
     get_container_status,
+    pull_image_if_missing,
     get_dockerfile_filepath,
     jsonfile2dict,
     remove_container,
@@ -219,56 +221,76 @@ async def run_train_container(
                 dataset_sql_api.get_dataset(db, train_container.dataset_id)
             )
 
-            if train_container.container_id is not None:
-                get_container(train_container.container_id).start()
-            else:
-                run_parameters = {
-                    "image": train_container.image_id,
-                    "environment": {
-                        "OID_ACCESS_TOKEN": user.access_token,
-                        "S3_HOST": "http://minio:9000",
-                        "S3_BUCKET_NAME": train_container.dataset.bucket_name,
-                        "DATASET_ID": dataset.id,
-                    },
-                    "network": f"{os.environ.get('PROJECT_NAME')}_network",
-                    "privileged": True,
-                    "cap_add": ["SYS_ADMIN"],
-                    "devices": ["/dev/fuse:/dev/fuse"],
-                    "detach": True,
-                    "remove": False,
-                    "ipc_mode": "host",
-                    "ulimits": [
-                        Ulimit(name="memlock", soft=-1, hard=-1),
-                        Ulimit(name="stack", soft=67108864, hard=67108864),
-                    ],
-                }
+            if (
+                train_container.container_id is not None
+                and container_exists(train_container.container_id)
+                and get_container(train_container.container_id).status == "running"
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Train Container #{train_container_id} is already running.",
+                )
 
-                if gpu_available():
-                    # See: https://github.com/docker/docker-py/blob/82cf559b5a641f53e9035b44b91f829f3b4cca80/docker/types/containers.py
-                    gpu_device_ids = os.getenv("GPUS")
-                    gpu_device_request = (
-                        DeviceRequest(
-                            name="nvidia",
-                            device_ids=[gpu_device_ids],
-                            capabilities=[["gpu"]],
-                        )
-                        if (
-                            gpu_device_ids
-                            and gpu_device_ids != "all"
-                            and all(
-                                map(lambda x: x.isdigit(), gpu_device_ids.split(","))
-                            )
-                        )
-                        else DeviceRequest(
-                            name="nvidia", count=-1, capabilities=[["gpu"]]
+            # The access token is written into the container environment at
+            # creation time and Docker cannot change the environment of an
+            # existing container. Pulling a cold image can take longer than the
+            # token lives (300 s), so pull first and only then create a fresh
+            # container with the token from this request. A container left over
+            # from an earlier run still carries the token of that run.
+            pull_image_if_missing(train_container.image_id)
+
+            if train_container.container_id is not None:
+                remove_container(train_container.container_id, force=True)
+                train_container.container_id = None
+                sql_api.update_train_container(db, train_container)
+
+            run_parameters = {
+                "image": train_container.image_id,
+                "environment": {
+                    "OID_ACCESS_TOKEN": user.access_token,
+                    "S3_HOST": "http://minio:9000",
+                    "S3_BUCKET_NAME": train_container.dataset.bucket_name,
+                    "DATASET_ID": dataset.id,
+                },
+                "network": f"{os.environ.get('PROJECT_NAME')}_network",
+                "privileged": True,
+                "cap_add": ["SYS_ADMIN"],
+                "devices": ["/dev/fuse:/dev/fuse"],
+                "detach": True,
+                "remove": False,
+                "ipc_mode": "host",
+                "ulimits": [
+                    Ulimit(name="memlock", soft=-1, hard=-1),
+                    Ulimit(name="stack", soft=67108864, hard=67108864),
+                ],
+            }
+
+            if gpu_available():
+                # See: https://github.com/docker/docker-py/blob/82cf559b5a641f53e9035b44b91f829f3b4cca80/docker/types/containers.py
+                gpu_device_ids = os.getenv("GPUS")
+                gpu_device_request = (
+                    DeviceRequest(
+                        name="nvidia",
+                        device_ids=[gpu_device_ids],
+                        capabilities=[["gpu"]],
+                    )
+                    if (
+                        gpu_device_ids
+                        and gpu_device_ids != "all"
+                        and all(
+                            map(lambda x: x.isdigit(), gpu_device_ids.split(","))
                         )
                     )
+                    else DeviceRequest(
+                        name="nvidia", count=-1, capabilities=[["gpu"]]
+                    )
+                )
 
-                    run_parameters["device_requests"] = [gpu_device_request]
-                    run_parameters["environment"]["NVIDIA_VISIBLE_DEVICES"] = "all"
+                run_parameters["device_requests"] = [gpu_device_request]
+                run_parameters["environment"]["NVIDIA_VISIBLE_DEVICES"] = "all"
 
-                container = docker_host_client.containers.run(**run_parameters)
-                train_container.container_id = container.id
+            container = docker_host_client.containers.run(**run_parameters)
+            train_container.container_id = container.id
 
             train_container.score = None
             sql_api.update_train_container(db, train_container)
