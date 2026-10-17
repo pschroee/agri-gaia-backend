@@ -27,6 +27,7 @@ from agri_gaia_backend.db import models
 from agri_gaia_backend.routers import common
 from agri_gaia_backend.routers.common import check_exists, get_db
 from agri_gaia_backend.schemas.keycloak_user import KeycloakUser
+from agri_gaia_backend.schemas.metadata import MetadataDocument
 from agri_gaia_backend.schemas.model import Model, ModelPatch
 from agri_gaia_backend.services import minio_api
 from agri_gaia_backend.services.edc.connector import (
@@ -95,6 +96,27 @@ def get_all_data_for_keyword(
 @router.get("/{model_id}", response_model=Model)
 def get_model(model_id: int, db: Session = Depends(get_db)):
     return check_exists(sql_api.get_model(db, model_id))
+
+
+@router.get("/{model_id}/metadata", response_model=MetadataDocument)
+def get_model_metadata(
+    request: Request, model_id: int, db: Session = Depends(get_db)
+):
+    """Returns the description of a model from the triple store (X4, #146).
+
+    Models carry no uploader metadata; the field stays empty so that the answer has the
+    same shape as the dataset's. Only the owner may read the description.
+    """
+    model = check_exists(sql_api.get_model(db, model_id))
+    if model.owner != request.user.username:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the owner can read the metadata of this model.",
+        )
+    description = ""
+    if model.metadata_uri:
+        description = sparql_util.get_description_for_uri(model.metadata_uri)
+    return MetadataDocument(description=description, metadata={})
 
 
 # Downloads all data from a passed dataset in a passed bucket, using the passed token for authentication and authorization

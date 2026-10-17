@@ -44,6 +44,7 @@ from agri_gaia_backend.routers.common import (
 from agri_gaia_backend.schemas.cvat import CvatAuthDataSchema
 from agri_gaia_backend.schemas.dataset import Dataset
 from agri_gaia_backend.schemas.keycloak_user import KeycloakUser
+from agri_gaia_backend.schemas.metadata import MetadataDocument
 from agri_gaia_backend.services import minio_api
 from agri_gaia_backend.services.cvat.cvat_api import get_task_annotations, remove_task
 from agri_gaia_backend.services.edc.connector import (
@@ -178,6 +179,30 @@ def get_dataset(dataset_id: int, db: Session = Depends(get_db)):
         HTTPException: No dataset is found for the given ID.
     """
     return check_exists(sql_api.get_dataset(db, dataset_id))
+
+
+@router.get("/{dataset_id}/metadata", response_model=MetadataDocument)
+def get_dataset_metadata(
+    request: Request, dataset_id: int, db: Session = Depends(get_db)
+):
+    """Returns the description and the uploader's metadata from the triple store.
+
+    The fixture verification of the experiment runner needs both (X4, #146). They are not
+    part of the Postgres row, so this reads them from Fuseki. Only the owner may read them;
+    no other user's dataset becomes visible through this route.
+    """
+    dataset = check_exists(sql_api.get_dataset(db, dataset_id))
+    if dataset.owner != request.user.username:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the owner can read the metadata of this dataset.",
+        )
+    if not dataset.metadata_uri:
+        return MetadataDocument(description="", metadata={})
+    return MetadataDocument(
+        description=sparql_util.get_description_for_uri(dataset.metadata_uri),
+        metadata=sparql_datasets_api.get_user_metadata_for_uri(dataset.metadata_uri),
+    )
 
 
 @router.get("/{dataset_id}/download")

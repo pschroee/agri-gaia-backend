@@ -18,6 +18,7 @@ from starlette.status import (
     HTTP_200_OK,
     HTTP_201_CREATED,
     HTTP_204_NO_CONTENT,
+    HTTP_403_FORBIDDEN,
     HTTP_404_NOT_FOUND,
 )
 
@@ -25,6 +26,7 @@ from agri_gaia_backend import schemas
 from agri_gaia_backend.db import model_api
 
 from sqlalchemy.orm import Session
+from types import SimpleNamespace
 
 from minio import Minio
 
@@ -245,3 +247,40 @@ class TestDatasetDelete:
         )
         assert len(minio_objects) == 1, "Files in MinIO shouln't have been not deleted"
         # TODO check tt metadata in fuseki is deleted
+
+
+class TestModelMetadata:
+    """#146: the fixture verification reads the description from the triple store."""
+
+    def test_metadata_of_own_model(
+        self, testclient: TestClient, test_model: schemas.Model
+    ):
+        response = testclient.get(f"/models/{test_model.id}/metadata")
+        assert response.status_code == HTTP_200_OK, "Error getting model metadata"
+        body = response.json()
+        assert (
+            body["description"] == "This is a test model with a single file."
+        ), "Description differs from the one the model was created with"
+        assert body["metadata"] == {}, "Models carry no uploader metadata"
+
+    def test_metadata_of_missing_model(self, testclient: TestClient):
+        response = testclient.get("/models/-10/metadata")
+        assert (
+            response.status_code == HTTP_404_NOT_FOUND
+        ), "Metadata of a missing model shouldn't have been returned"
+
+    def test_metadata_of_foreign_model(
+        self,
+        testclient: TestClient,
+        test_model: schemas.Model,
+        monkeypatch,
+    ):
+        foreign = SimpleNamespace(
+            id=test_model.id, owner="someone-else", metadata_uri=test_model.metadata_uri
+        )
+        monkeypatch.setattr(model_api, "get_model", lambda db, model_id: foreign)
+        response = testclient.get(f"/models/{test_model.id}/metadata")
+        assert (
+            response.status_code == HTTP_403_FORBIDDEN
+        ), "A foreign model's metadata must not be readable"
+        assert "someone-else" not in response.text
