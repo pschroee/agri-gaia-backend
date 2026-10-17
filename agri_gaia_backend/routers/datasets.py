@@ -812,7 +812,11 @@ def delete_dataset(
 
     try:
         response = sparql_util.delete_graph(f"dataset-{dataset_id}")
-        response.raise_for_status()
+        # The graph dataset-<id> exists only temporarily: the upload creates it for
+        # the SHACL validation and deletes it again afterwards. A 404 therefore means
+        # that there is nothing left to delete and counts as a successful cleanup.
+        if response.status_code != 404:
+            response.raise_for_status()
     except Exception as e:
         logger.error(
             "Deleting the dataset graph from Fuseki failed. Stacktrace:\n"
