@@ -635,7 +635,7 @@ def _upload_dataset_to_minio(
                 file=annotation_file,
             )
             del files[-1]
-        if files and is_classification_dataset and dataset_type is "AgriImageDataResource":
+        if files and is_classification_dataset and dataset_type == "AgriImageDataResource":
             iaw = cvat.CVATImageAnnotationWriter()
             images: List[cvat.CVATImage] = []
             id = 0

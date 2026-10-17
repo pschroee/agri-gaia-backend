@@ -28,6 +28,7 @@ from agri_gaia_backend import schemas
 from agri_gaia_backend.db import dataset_api
 from agri_gaia_backend.routers.datasets import _get_dataset_filesize
 
+from PIL import Image
 from minio import Minio
 from types import SimpleNamespace
 from typing import Dict
@@ -46,6 +47,21 @@ class TestDatasetFilesize:
     def test_file_sizes_are_summed(self):
         objects = [SimpleNamespace(size=5), SimpleNamespace(size=7)]
         assert _get_dataset_filesize(objects) == 12
+
+
+def build_classification_zip() -> BytesIO:
+    """Builds a zip with one image per class folder (#150)."""
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for name, color in (
+            ("dataset/cats/cat.png", (255, 0, 0)),
+            ("dataset/dogs/dog.png", (0, 255, 0)),
+        ):
+            image_bytes = BytesIO()
+            Image.new("RGB", (4, 4), color).save(image_bytes, format="PNG")
+            archive.writestr(name, image_bytes.getvalue())
+    buffer.seek(0)
+    return buffer
 
 
 class TestGetDataset:
@@ -256,6 +272,107 @@ class TestCreateDataset:
         assert response_dataset.total_filesize == len(
             testfile_content
         ), "Total file size of dataset differs from total file size of given files"
+
+
+class TestCreateClassificationDataset:
+    """#150: the classification branch must actually be reached."""
+
+    def test_zip_reaches_classification_branch(
+        self,
+        request,
+        cvat_authentication_data,
+        authenticated_client: TestClient,
+        minio_client: Minio,
+    ):
+        data = {
+            "name": "Classification-Test-Dataset",
+            "description": "This is a classification dataset from a zip.",
+            "includes_annotation_file": False,
+            "is_classification_dataset": True,
+            "dataset_type": "AgriImageDataResource",
+            "metadata": "{}",
+        }
+        files = {"files": ("dataset.zip", build_classification_zip())}
+
+        response = authenticated_client.post("/datasets", data=data, files=files)
+
+        def dataset_delete(response):
+            if response.is_success:
+                response_dataset = schemas.Dataset(**response.json())
+                authenticated_client.request(
+                    "DELETE",
+                    f"/datasets/{response_dataset.id}",
+                    json=cvat_authentication_data,
+                )
+
+        request.addfinalizer(lambda: dataset_delete(response=response))
+
+        assert response.status_code == HTTP_201_CREATED, "Error creating dataset"
+        response_dataset = schemas.Dataset(**response.json())
+        assert sorted(response_dataset.annotation_labels) == [
+            "cats",
+            "dogs",
+        ], "The zip's class folders were not used as annotation labels"
+
+        object_names = {
+            item.object_name
+            for item in minio_client.list_objects(
+                response_dataset.bucket_name,
+                get_dataset_bucket_prefix(response_dataset),
+                recursive=True,
+            )
+        }
+        assert (
+            f"datasets/{response_dataset.id}/dataset/cats/cat.png" in object_names
+        ), "The zip's images were not uploaded"
+        assert (
+            f"datasets/{response_dataset.id}/annotations/annotations.xml" in object_names
+        ), "The generated annotations were not uploaded"
+        assert (
+            response_dataset.filecount == 3
+        ), "The dataset should contain two images and annotations.xml"
+
+    def test_annotation_file_only_is_not_treated_as_zip(
+        self,
+        request,
+        cvat_authentication_data,
+        authenticated_client: TestClient,
+    ):
+        """An annotation file is removed from the list before the zip check."""
+        annotation = (
+            b"<annotations><meta><task><id>1</id></task></meta></annotations>"
+        )
+        data = {
+            "name": "Classification-Annotation-Test-Dataset",
+            "description": "This is a classification dataset with only an annotation file.",
+            "includes_annotation_file": True,
+            "is_classification_dataset": True,
+            "dataset_type": "AgriImageDataResource",
+            "metadata": "{}",
+        }
+        files = {"files": ("annotations.xml", BytesIO(annotation))}
+
+        response = authenticated_client.post("/datasets", data=data, files=files)
+
+        def dataset_delete(response):
+            if response.is_success:
+                response_dataset = schemas.Dataset(**response.json())
+                authenticated_client.request(
+                    "DELETE",
+                    f"/datasets/{response_dataset.id}",
+                    json=cvat_authentication_data,
+                )
+
+        request.addfinalizer(lambda: dataset_delete(response=response))
+
+        assert response.status_code == HTTP_201_CREATED, "Error creating dataset"
+        response_dataset = schemas.Dataset(**response.json())
+        assert (
+            response_dataset.filecount == 1
+        ), "Only the annotation file should have been uploaded"
+        assert response_dataset.total_filesize == len(
+            annotation
+        ), "Total file size differs from the annotation file's size"
 
 
 class TestDatasetDelete:

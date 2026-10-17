@@ -259,7 +259,7 @@ def create_graph(
 def _handle_type(graph, metadata, dataset_id: URIRef, dataset_type: str, config_files):
     metadata = json.loads(metadata)
 
-    if dataset_type is "AgriSyntheticImageDataResource":
+    if dataset_type == "AgriSyntheticImageDataResource":
         graph, metadata = _handle_synthetic_dataset(
             graph=graph,
             metadata=metadata,
@@ -279,7 +279,11 @@ def _handle_type(graph, metadata, dataset_id: URIRef, dataset_type: str, config_
 
 
 def _handle_synthetic_dataset(graph, metadata, config_files, fuseki_id):
-    if config_files["config"] is not None and config_files["asset_catalog"] is not None:
+    if (
+        config_files
+        and config_files["config"] is not None
+        and config_files["asset_catalog"] is not None
+    ):
         config_file_yaml = yaml.safe_load(config_files["config"].file.read())
         asset_catalog_file_yaml = yaml.safe_load(
             config_files["asset_catalog"].file.read()
