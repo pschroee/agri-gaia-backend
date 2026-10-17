@@ -620,7 +620,7 @@ def _upload_dataset_to_minio(
         dataset_prefix = f"datasets/{dataset.id}"
         labels = []
 
-        if includes_annotation_file:
+        if includes_annotation_file and files:
             annotation_file = files[-1]
 
             if is_cvat_annotation_xml(annotation_file):
@@ -635,7 +635,7 @@ def _upload_dataset_to_minio(
                 file=annotation_file,
             )
             del files[-1]
-        if is_classification_dataset and dataset_type is "AgriImageDataResource":
+        if files and is_classification_dataset and dataset_type is "AgriImageDataResource":
             iaw = cvat.CVATImageAnnotationWriter()
             images: List[cvat.CVATImage] = []
             id = 0
@@ -1316,7 +1316,9 @@ def _get_docker_container_fuzzy(fuzzy_name: str):
 
 
 def _get_dataset_filesize(dataset_objects):
-    return reduce(lambda x, y: x + y, map(lambda o: o.size, dataset_objects))
+    # A dataset without files has no objects in MinIO; reduce() needs the
+    # initial value 0 to return 0 instead of raising a TypeError.
+    return reduce(lambda x, y: x + y, map(lambda o: o.size, dataset_objects), 0)
 
 
 def _validate_parameters(bucket, token):
