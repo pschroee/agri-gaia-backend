@@ -26,6 +26,7 @@ from fastapi.testclient import TestClient
 
 from agri_gaia_backend import schemas
 from agri_gaia_backend.db import dataset_api
+from agri_gaia_backend.routers.datasets import _get_dataset_filesize
 
 from minio import Minio
 from types import SimpleNamespace
@@ -34,6 +35,17 @@ from typing import Dict
 
 def get_dataset_bucket_prefix(dataset: schemas.Dataset) -> str:
     return f"datasets/{dataset.id}/"
+
+
+class TestDatasetFilesize:
+    """#148: _get_dataset_filesize must not fail on a dataset without files."""
+
+    def test_dataset_without_files_has_size_zero(self):
+        assert _get_dataset_filesize([]) == 0
+
+    def test_file_sizes_are_summed(self):
+        objects = [SimpleNamespace(size=5), SimpleNamespace(size=7)]
+        assert _get_dataset_filesize(objects) == 12
 
 
 class TestGetDataset:
@@ -147,9 +159,14 @@ class TestDownloadDataset:
 
 
 class TestCreateDataset:
-    def test_create_empty_dataset_not_allowed(
-        self, request, authenticated_client: TestClient, db: Session
+    def test_create_dataset_without_files(
+        self,
+        request,
+        cvat_authentication_data: Dict,
+        authenticated_client: TestClient,
+        db: Session,
     ):
+        """#148: a dataset without files is valid; size and file count are 0."""
         data = {
             "name": "Empty-Test-Dataset",
             "description": "This is a test dataset with no files.",
@@ -164,16 +181,25 @@ class TestCreateDataset:
         def dataset_delete(response):
             if response.is_success:
                 response_dataset = schemas.Dataset(**response.json())
-                deletion_response = authenticated_client.delete(
-                    f"/datasets/{response_dataset.id}"
+                authenticated_client.request(
+                    "DELETE",
+                    f"/datasets/{response_dataset.id}",
+                    json=cvat_authentication_data,
                 )
 
         request.addfinalizer(lambda: dataset_delete(response=response))
 
-        assert not response.is_success, "Creating an empty dataset shouldn't be allowed"
         assert (
-            len(dataset_api.get_datasets(db)) == num_datasets_before
-        ), "Dataset was created"
+            response.status_code == HTTP_201_CREATED
+        ), "Creating a dataset without files failed"
+        response_dataset = schemas.Dataset(**response.json())
+        assert response_dataset.filecount == 0, "Dataset without files has a file count"
+        assert (
+            response_dataset.total_filesize == 0
+        ), "Dataset without files has a total file size"
+        assert (
+            len(dataset_api.get_datasets(db)) == num_datasets_before + 1
+        ), "Dataset was not created"
 
     def test_create_dataset_single_file(
         self,
