@@ -6,6 +6,7 @@
 # SPDX-FileContributor: Maik Fruhner
 # SPDX-FileContributor: Prof. Dr.-Ing. Heiko Tapken
 # SPDX-FileContributor: Tobias Wamhof
+# SPDX-FileContributor: Philipp Schröer
 #
 # SPDX-License-Identifier: MIT
 
@@ -72,7 +73,7 @@ from fastapi import (
 )
 from fastapi.datastructures import UploadFile
 from fastapi.param_functions import File
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from agri_gaia_backend.util.env import NUCLIO_CVAT_PROJECT_NAME
@@ -734,25 +735,44 @@ def delete_dataset(
     request: Request,
     cvat_auth: CvatAuthDataSchema,
     dataset_id: int,
+    annotation_task_id: Optional[int] = None,
     db: Session = Depends(get_db),
 ):
     """
-    Deletes a dataset.
+    Deletes a dataset and everything derived from it.
 
-    Deletes the dataset entry from the Postgres database, the metadata from Fuseki as well as the uploaded files from MinIO.
+    The steps run one after another, each with its own error handling: database
+    entry, metadata and graph in Fuseki, files in the CVAT server container, CVAT
+    task and finally the files in MinIO. A failing cleanup step no longer aborts the
+    remaining steps. If a cleanup step fails after the database entry is gone, the
+    response is a named partial success (HTTP 207) instead of a server error.
+
+    Deleting a dataset whose database entry is already gone is idempotent: the
+    remaining files in the caller's bucket and, if ``annotation_task_id`` is given,
+    the caller's CVAT task are cleaned up. That lets a caller finish a delete that
+    failed during cleanup before the fix.
 
     Args:
         request: The request object containing information on the user.
             (like authentication token, his bucket name in MinIO, ...)
-        cvat_auth: CVAT authentication data (sessionid, key, csrftoken)
+        cvat_auth: CVAT authentication data (sessionid, key, csrftoken). Used as a
+            fallback when the platform's CVAT superuser is not configured.
         dataset_id: The ID of the dataset to be deleted.
+        annotation_task_id: CVAT task to clean up when the database entry is already
+            gone. Ignored for an existing dataset, which keeps its stored task ID.
         db: Database Session. Created automatically.
 
     Returns:
-        Success status code.
+        204 if everything was removed. 207 with a named list of failed cleanup steps
+        when the dataset entry was deleted but a cleanup step failed.
     """
-    dataset = check_exists(sql_api.get_dataset(db, dataset_id))
     user: KeycloakUser = request.user
+    dataset = sql_api.get_dataset(db, dataset_id)
+
+    if dataset is None:
+        return _remove_dataset_leftovers(
+            user, dataset_id, annotation_task_id, dict(cvat_auth)
+        )
 
     if user.username != dataset.owner:
         raise HTTPException(
@@ -764,18 +784,81 @@ def delete_dataset(
     try:
         sql_api.delete_dataset(db, dataset)
     except IntegrityError as e:
+        logger.error(
+            "Deleting the dataset entry failed. Stacktrace:\n" + get_stacktrace(e)
+        )
         raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        logger.error(
+            "Deleting the dataset entry failed. Stacktrace:\n" + get_stacktrace(e)
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Deleting the dataset entry failed. Nothing was removed.",
+        )
+
+    failed_steps = []
 
     if dataset.metadata_uri is not None:
-        sparql_datasets_api.delete_dataset(dataset.metadata_uri)
-    sparql_util.delete_graph(f"dataset-{dataset_id}")
+        try:
+            response = sparql_datasets_api.delete_dataset(dataset.metadata_uri)
+            response.raise_for_status()
+        except Exception as e:
+            logger.error(
+                "Deleting the dataset metadata from Fuseki failed. Stacktrace:\n"
+                + get_stacktrace(e)
+            )
+            failed_steps.append(_failed_step("fuseki_metadata", e))
 
-    _remove_files_from_cvat(dict(cvat_auth), dataset)
+    try:
+        response = sparql_util.delete_graph(f"dataset-{dataset_id}")
+        response.raise_for_status()
+    except Exception as e:
+        logger.error(
+            "Deleting the dataset graph from Fuseki failed. Stacktrace:\n"
+            + get_stacktrace(e)
+        )
+        failed_steps.append(_failed_step("fuseki_graph", e))
+
+    try:
+        _remove_files_from_cvat_container(dataset)
+    except Exception as e:
+        logger.error(
+            "Removing the dataset files from the CVAT server failed. Stacktrace:\n"
+            + get_stacktrace(e)
+        )
+        failed_steps.append(_failed_step("cvat_files", e))
+
+    if dataset.annotation_task_id is not None:
+        try:
+            remove_task(
+                dataset.annotation_task_id,
+                dict(cvat_auth),
+                owner=user.username,
+            )
+        except Exception as e:
+            logger.error(
+                "Deleting the CVAT annotation task failed. Stacktrace:\n"
+                + get_stacktrace(e)
+            )
+            failed_steps.append(
+                _failed_step("cvat_task", e, task_id=dataset.annotation_task_id)
+            )
 
     dataset_prefix = f"datasets/{dataset.id}/"
-    minio_api.delete_all_objects(
-        dataset.bucket_name, prefix=dataset_prefix, token=user.minio_token
-    )
+    try:
+        minio_api.delete_all_objects(
+            dataset.bucket_name, prefix=dataset_prefix, token=user.minio_token
+        )
+    except Exception as e:
+        logger.error(
+            "Deleting the dataset files from MinIO failed. Stacktrace:\n"
+            + get_stacktrace(e)
+        )
+        failed_steps.append(_failed_step("minio_objects", e))
+
+    if failed_steps:
+        return _partial_failure_response(dataset_id, failed_steps)
 
     return Response(status_code=204)
 
@@ -1229,14 +1312,102 @@ def _remove_files_from_minio(bucket_name: str, dataset_prefix: str, token):
         bucket_name, prefix=dataset_prefix, token=token)
 
 
-def _remove_files_from_cvat(cvat_auth: Dict, dataset: Dataset) -> None:
+def _remove_files_from_cvat_container(dataset: Dataset) -> None:
+    """Remove the dataset's files from the shared volume of the CVAT server container."""
     cvat_server = _get_docker_container_fuzzy("cvat_server")
     if cvat_server is not None:
         cvat_server.exec_run(
             f"/bin/bash -c 'rm $HOME/share/{dataset.bucket_name}/{dataset.id}'"
         )
-    if dataset.annotation_task_id is not None:
-        remove_task(cvat_auth, dataset.annotation_task_id)
+
+
+_CLEANUP_STEP_DETAILS = {
+    "fuseki_metadata": "Deleting the dataset metadata from the triple store failed.",
+    "fuseki_graph": "Deleting the dataset graph from the triple store failed.",
+    "cvat_files": "Removing the dataset files from the CVAT server container failed.",
+    "cvat_task": "Deleting the CVAT annotation task failed.",
+    "minio_objects": "Deleting the dataset files from MinIO failed.",
+}
+
+
+def _failed_step(step: str, error: Exception, **extra) -> Dict:
+    """Describe a failed cleanup step.
+
+    The exception text stays in the server log. Only the fixed description and the
+    exception type reach the response, so no token, key or signed URL can leak
+    through an error message (#141).
+    """
+    return {
+        "step": step,
+        "error_type": type(error).__name__,
+        "detail": _CLEANUP_STEP_DETAILS[step],
+        **extra,
+    }
+
+
+def _partial_failure_response(dataset_id: int, failed_steps: List[Dict]) -> JSONResponse:
+    """Report a delete whose database entry is gone but whose cleanup was incomplete."""
+    step_names = ", ".join(step["step"] for step in failed_steps)
+    logger.error(
+        f"Dataset {dataset_id} was deleted, but cleanup failed for: {step_names}."
+    )
+    return JSONResponse(
+        status_code=status.HTTP_207_MULTI_STATUS,
+        content={
+            "status": "partial",
+            "dataset_id": dataset_id,
+            "deleted": True,
+            "message": (
+                f"The dataset entry was deleted, but cleanup failed for: {step_names}. "
+                "Repeat the DELETE to finish the cleanup; pass annotation_task_id "
+                "for a CVAT task that is still left over."
+            ),
+            "failed_steps": failed_steps,
+        },
+    )
+
+
+def _remove_dataset_leftovers(
+    user: KeycloakUser,
+    dataset_id: int,
+    annotation_task_id: Optional[int],
+    cvat_auth: Dict,
+) -> Response:
+    """Clean up after a delete whose database entry is already gone.
+
+    Runs only against the caller's own bucket and a CVAT task the caller owns, so a
+    repeated DELETE cannot touch foreign data.
+    """
+    failed_steps = []
+
+    if annotation_task_id is not None:
+        try:
+            remove_task(annotation_task_id, cvat_auth, owner=user.username)
+        except Exception as e:
+            logger.error(
+                "Deleting the CVAT annotation task failed. Stacktrace:\n"
+                + get_stacktrace(e)
+            )
+            failed_steps.append(
+                _failed_step("cvat_task", e, task_id=annotation_task_id)
+            )
+
+    dataset_prefix = f"datasets/{dataset_id}/"
+    try:
+        minio_api.delete_all_objects(
+            user.minio_bucket_name, prefix=dataset_prefix, token=user.minio_token
+        )
+    except Exception as e:
+        logger.error(
+            "Deleting the dataset files from MinIO failed. Stacktrace:\n"
+            + get_stacktrace(e)
+        )
+        failed_steps.append(_failed_step("minio_objects", e))
+
+    if failed_steps:
+        return _partial_failure_response(dataset_id, failed_steps)
+
+    return Response(status_code=204)
 
 
 def update_annotations_from_cvat(dataset: Dataset, minio_token: str) -> None:
