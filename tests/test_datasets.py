@@ -18,6 +18,7 @@ from starlette.status import (
     HTTP_200_OK,
     HTTP_201_CREATED,
     HTTP_204_NO_CONTENT,
+    HTTP_403_FORBIDDEN,
     HTTP_404_NOT_FOUND,
 )
 from sqlalchemy.orm import Session
@@ -27,6 +28,7 @@ from agri_gaia_backend import schemas
 from agri_gaia_backend.db import dataset_api
 
 from minio import Minio
+from types import SimpleNamespace
 from typing import Dict
 
 
@@ -312,3 +314,48 @@ class TestDatasetDelete:
         )
         assert len(minio_objects) == 1, "Files shouldn't have been deleted"
         # TODO check that metadata in fuseki is deleted
+
+
+class TestDatasetMetadata:
+    """#146: the fixture verification reads description and metadata from the triple store."""
+
+    def test_metadata_of_own_dataset(
+        self, authenticated_client: TestClient, test_dataset: schemas.Dataset
+    ):
+        response = authenticated_client.get(
+            f"/datasets/{test_dataset.id}/metadata"
+        )
+        assert response.status_code == HTTP_200_OK, "Error getting dataset metadata"
+        body = response.json()
+        assert (
+            body["description"] == "This is a test dataset with a single file."
+        ), "Description differs from the one the dataset was created with"
+        assert body["metadata"] == {}, "The test dataset carries no additional metadata"
+
+    def test_metadata_of_missing_dataset(self, authenticated_client: TestClient):
+        response = authenticated_client.get("/datasets/-10/metadata")
+        assert (
+            response.status_code == HTTP_404_NOT_FOUND
+        ), "Metadata of a missing dataset shouldn't have been returned"
+
+    def test_metadata_of_foreign_dataset(
+        self,
+        authenticated_client: TestClient,
+        test_dataset: schemas.Dataset,
+        monkeypatch,
+    ):
+        foreign = SimpleNamespace(
+            id=test_dataset.id,
+            owner="someone-else",
+            metadata_uri=test_dataset.metadata_uri,
+        )
+        monkeypatch.setattr(
+            dataset_api, "get_dataset", lambda db, dataset_id: foreign
+        )
+        response = authenticated_client.get(
+            f"/datasets/{test_dataset.id}/metadata"
+        )
+        assert (
+            response.status_code == HTTP_403_FORBIDDEN
+        ), "A foreign dataset's metadata must not be readable"
+        assert "someone-else" not in response.text

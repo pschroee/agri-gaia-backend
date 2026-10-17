@@ -17,6 +17,7 @@ from agri_gaia_backend.schemas.docker_container import *
 from agri_gaia_backend.schemas.edge_device import *
 from agri_gaia_backend.schemas.edge_group import *
 from agri_gaia_backend.schemas.keycloak_user import *
+from agri_gaia_backend.schemas.metadata import *
 from agri_gaia_backend.schemas.model_deployment import *
 from agri_gaia_backend.schemas.model import *
 from agri_gaia_backend.schemas.registry_user import *

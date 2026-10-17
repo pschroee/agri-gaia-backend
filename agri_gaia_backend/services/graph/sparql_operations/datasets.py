@@ -99,6 +99,51 @@ def get_metadata_information(dataset_id):
     return response
 
 
+AGRI_GAIA_ASSET_NAMESPACE = "http://w3id.org/agri-gaia-x/asset#"
+
+
+def get_user_metadata_for_uri(uri: str):
+    """Returns the metadata the uploader passed at creation as key/value pairs.
+
+    _handle_type stores it as properties in the agri-gaia asset namespace next to the
+    standard DCAT triples. The experiment runner compares these values with its fixture
+    manifest (X4, #146); the rest of the graph is not part of that metadata.
+    """
+    query = f"""SELECT ?p ?o WHERE {{
+        <{uri}> ?p ?o .
+        FILTER(STRSTARTS(STR(?p), "{AGRI_GAIA_ASSET_NAMESPACE}"))
+    }}"""
+    response = util.send_query(SPARQL_QUERY_ENDPOINT, query)["results"]["bindings"]
+    metadata = {}
+    for row in response:
+        key = row["p"]["value"].rsplit("#", 1)[-1]
+        metadata[key] = _binding_value(row["o"])
+    return metadata
+
+
+def _binding_value(binding):
+    """Returns a SPARQL binding as the JSON value the metadata came from.
+
+    The graph stores the values as literals; typed literals are converted back, so that a
+    number or a boolean in the manifest can be compared with the stored value.
+    """
+    value = binding.get("value")
+    datatype = binding.get("datatype", "")
+    if datatype.endswith("#boolean"):
+        return value == "true"
+    if datatype.endswith(("#integer", "#int", "#long", "#short", "#byte")):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return value
+    if datatype.endswith(("#double", "#float", "#decimal")):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return value
+    return value
+
+
 def delete_dataset(dataset_id):
     dataset_id_splitted = dataset_id.split("#")
     dataset_id_splitted[-1] = "_Distribution"
