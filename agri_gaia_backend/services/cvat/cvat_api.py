@@ -8,6 +8,7 @@
 # SPDX-FileContributor: Maik Fruhner
 # SPDX-FileContributor: Prof. Dr.-Ing. Heiko Tapken
 # SPDX-FileContributor: Tobias Wamhof
+# SPDX-FileContributor: Philipp Schröer
 #
 # SPDX-License-Identifier: MIT
 
@@ -21,7 +22,7 @@ import time
 import zipfile
 import xmltodict
 from base64 import b64encode
-from typing import Dict, Union
+from typing import Dict, Optional, Union
 
 import docker
 from agri_gaia_backend.schemas.dataset import Dataset
@@ -202,8 +203,59 @@ def create_task_for_dataset(
     return {"id": task_id, "next": f"/tasks/{task_id}"}
 
 
-def remove_task(auth: Dict, task_id: int) -> None:
-    cvatClient.delete_task(task_id=task_id, auth_data=auth)
+def remove_task(
+    task_id: int, auth: Optional[Dict] = None, owner: Optional[str] = None
+) -> None:
+    """Delete a CVAT task.
+
+    The platform deletes with the CVAT superuser when it is configured, so callers
+    without a CVAT session (for example the agent gateway, which sends placeholders)
+    can clean up as well. The caller's session is only a fallback.
+
+    If ``owner`` is given, the task is only deleted when the CVAT owner matches. That
+    protects the cleanup path that runs after the database entry is already gone and
+    therefore has no dataset owner left to check against.
+
+    A task that is already gone (HTTP 404) counts as deleted.
+    """
+    superuser_configured = bool(
+        os.getenv("CVAT_SUPERUSER") and os.getenv("CVAT_SUPERUSER_PASSWORD")
+    )
+    if superuser_configured:
+        auth_data = dict(cvatClient.login_superuser())
+    elif auth is not None:
+        auth_data = auth
+    else:
+        raise ValueError("No CVAT credentials available for task deletion.")
+
+    try:
+        if owner is not None:
+            try:
+                task = cvatClient.get_task(task_id=task_id, auth_data=auth_data)
+            except HTTPError as e:
+                if e.response is not None and e.response.status_code == 404:
+                    logger.info(f"CVAT task {task_id} is already gone.")
+                    return
+                raise
+            task_owner = (task.get("owner") or {}).get("username")
+            if task_owner != owner:
+                raise PermissionError(
+                    f"CVAT task {task_id} belongs to '{task_owner}', not to '{owner}'."
+                )
+
+        try:
+            cvatClient.delete_task(task_id=task_id, auth_data=auth_data)
+        except HTTPError as e:
+            if e.response is not None and e.response.status_code == 404:
+                logger.info(f"CVAT task {task_id} is already gone.")
+                return
+            raise
+    finally:
+        if superuser_configured:
+            try:
+                cvatClient.logout(auth_data)
+            except Exception as e:
+                logger.warning(f"Logging out of CVAT failed: {e}")
 
 
 def get_task_annotations(task_id: int) -> Union[str, None]:
