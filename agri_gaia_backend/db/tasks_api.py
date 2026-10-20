@@ -6,6 +6,7 @@
 # SPDX-FileContributor: Maik Fruhner
 # SPDX-FileContributor: Prof. Dr.-Ing. Heiko Tapken
 # SPDX-FileContributor: Tobias Wamhof
+# SPDX-FileContributor: Philipp Schröer
 #
 # SPDX-License-Identifier: MIT
 
@@ -37,6 +38,7 @@ def get_tasks_by_initiator(
     return (
         db.query(Task)
         .filter(Task.initiator == initiator)
+        .order_by(Task.id.desc())
         .offset(skip)
         .limit(limit)
         .all()
