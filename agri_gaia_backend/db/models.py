@@ -6,6 +6,7 @@
 # SPDX-FileContributor: Maik Fruhner
 # SPDX-FileContributor: Prof. Dr.-Ing. Heiko Tapken
 # SPDX-FileContributor: Tobias Wamhof
+# SPDX-FileContributor: Philipp Schröer
 #
 # SPDX-License-Identifier: MIT
 
@@ -21,6 +22,7 @@ from sqlalchemy import (
     Float,
     ForeignKey,
     Integer,
+    JSON,
     String,
     UniqueConstraint,
     Numeric,
@@ -284,6 +286,9 @@ class TrainContainer(Base):
     score_name = Column(String)
     score_regexp = Column(String)
     score = Column(Float, nullable=True)
+    # Full train_config of a clone (POST /train/containers/{id}/clone); applied when the
+    # clone gets its container on the first run.
+    config_override = Column(JSON, nullable=True)
 
 
 class TaskStatus(enum.Enum):

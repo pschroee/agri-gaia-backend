@@ -5,6 +5,15 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Training search support (issue #168 of the thesis repository)**:
+  - `model-training/templates/Torchvision/Classification/EfficientNet`: validation runs every epoch (`val_dataloader`, `validation_step`, `val_loss`, `val_acc`, `val_f1`; `limit_val_batches=0` removed from `util.py`), the new `metrics_callback.py` writes one line per epoch to `/train/metrics.jsonl` (and repeats the last line with `"saved": true` once the model is written), and the image carries the label `agrigaia.metrics="jsonl/1"`. Early stopping still monitors `train_loss`.
+  - `model-training/common/docker-entrypoint.sh`: when `nvidia-smi -L` works, GPU usage is sampled every 5 s into `/train/gpu.csv`.
+  - `agri_gaia_backend/routers/train.py`: `GET /train/containers/{id}/metrics` (epoch figures and GPU samples, also for exited containers), `POST /train/containers/{id}/clone` (copy of a built container with another `train_config`, same image, no build; new column `train_containers.config_override`, Alembic revision `7d3a1c5e9b42`), and `DELETE /train/containers/{id}` keeps the image while another row uses it.
+
 ## [1.0.0] - 2026-06-15
 
 ### Changed

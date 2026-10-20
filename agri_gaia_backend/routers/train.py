@@ -8,6 +8,7 @@
 # SPDX-FileContributor: Maik Fruhner
 # SPDX-FileContributor: Prof. Dr.-Ing. Heiko Tapken
 # SPDX-FileContributor: Tobias Wamhof
+# SPDX-FileContributor: Philipp Schröer
 #
 # SPDX-License-Identifier: MIT
 
@@ -40,6 +41,11 @@ from agri_gaia_backend.routers.common import (
     get_task_creator,
 )
 from agri_gaia_backend.util.common import gpu_available, get_torch_cuda_index
+from agri_gaia_backend.util.train_metrics import (
+    metrics_supported,
+    parse_gpu_csv,
+    parse_metrics_jsonl,
+)
 from agri_gaia_backend.routers.datasets import update_annotations_from_cvat
 from agri_gaia_backend.routers.models import persist_model, persist_model_artifact
 from agri_gaia_backend.schemas.keycloak_user import KeycloakUser
@@ -71,6 +77,9 @@ from agri_gaia_backend.util.train import (
     update_train_container_config,
     update_train_container_dataset,
     read_train_container_config,
+    merge_train_config,
+    get_config_container_filepath,
+    TRAIN_CONFIG_FILENAME,
 )
 from docker.types import DeviceRequest, Ulimit
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status, Form
@@ -215,6 +224,20 @@ def build_train_image(
         on_error(error_msg)
 
 
+def _clone_config_files(container_id: str, train_container) -> Dict[str, bytes]:
+    config_filepath = str(
+        get_config_container_filepath(
+            config_filename=TRAIN_CONFIG_FILENAME,
+            templates_path=TEMPLATES_PATH,
+            provider=train_container.provider,
+            architecture=train_container.architecture,
+        )
+    )
+    base_data = read_from_container(container_id, config_filepath)
+    base = json.loads(base_data.decode("utf-8")) if base_data else {}
+    return {config_filepath: merge_train_config(base, train_container.config_override)}
+
+
 @router.post("/containers/{train_container_id}/run")
 async def run_train_container(
     request: Request,
@@ -274,6 +297,7 @@ async def run_train_container(
             # Configuration edits and trained models live only in the old
             # container's filesystem. Keep them across the recreation.
             preserved_files = {}
+            first_run = train_container.container_id is None
             if train_container.container_id is not None:
                 preserved_files = read_train_container_files(
                     container_id=train_container.container_id,
@@ -334,6 +358,13 @@ async def run_train_container(
                 run_parameters["environment"]["NVIDIA_VISIBLE_DEVICES"] = "all"
 
             container = docker_host_client.containers.create(**run_parameters)
+            if first_run and train_container.config_override:
+                # A clone has no container yet: its train_config is the one baked into
+                # the image, overridden by the values given at clone time.
+                preserved_files = {
+                    **preserved_files,
+                    **_clone_config_files(container.id, train_container),
+                }
             write_train_container_files(container.id, preserved_files)
             container.start()
             train_container.container_id = container.id
@@ -464,6 +495,109 @@ def get_train_container(train_container_id: int, db: Session = Depends(get_db)) 
     return check_exists(sql_api.get_train_container(db, train_container_id))
 
 
+@router.get("/containers/{train_container_id}/metrics")
+def get_train_container_metrics(
+    train_container_id: int, db: Session = Depends(get_db)
+) -> Dict:
+    """Epoch figures (metrics.jsonl) and GPU samples (gpu.csv) of a training container.
+
+    Readable while the container runs and after it exited. Containers built from images
+    without the label agrigaia.metrics answer with supported=false and no rows.
+    """
+    train_container = check_exists(sql_api.get_train_container(db, train_container_id))
+
+    container = None
+    labels = None
+    if train_container.container_id is not None and container_exists(
+        train_container.container_id
+    ):
+        container = get_container(train_container.container_id)
+        try:
+            labels = container.image.labels
+        except Exception:
+            labels = None
+    if labels is None:
+        try:
+            labels = docker_host_client.images.get(train_container.image_id).labels
+        except Exception:
+            labels = None
+
+    result = {
+        "supported": metrics_supported(labels),
+        "epochs": [],
+        "gpu": [],
+        "gpu_available": False,
+    }
+    if container is None or not result["supported"]:
+        return result
+
+    result["epochs"] = parse_metrics_jsonl(
+        read_from_container(container.id, "/train/metrics.jsonl")
+    )
+    result["gpu"] = parse_gpu_csv(read_from_container(container.id, "/train/gpu.csv"))
+    result["gpu_available"] = bool(result["gpu"])
+    return result
+
+
+@router.post(
+    "/containers/{train_container_id}/clone",
+    status_code=status.HTTP_201_CREATED,
+    response_model=TrainContainer,
+)
+async def clone_train_container(
+    request: Request, train_container_id: int, db: Session = Depends(get_db)
+) -> TrainContainer:
+    """Creates a copy of a built training container with another train_config.
+
+    The copy uses the same image (no build). It gets its own container on the first run.
+    Body: {"train_config": {...}}, the complete configuration; nothing else is accepted.
+    """
+    user: KeycloakUser = request.user
+    base = check_exists(sql_api.get_train_container(db, train_container_id))
+
+    try:
+        data = await request.json()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Body is not valid JSON.")
+    if (
+        not isinstance(data, dict)
+        or set(data) != {"train_config"}
+        or not isinstance(data["train_config"], dict)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Body must be a JSON object with the single key 'train_config'.",
+        )
+    train_config = data["train_config"]
+
+    config_filepath, ext = get_config_filepath(
+        TEMPLATES_PATH, base.provider, base.architecture
+    )
+    if ext == ".jsonschema":
+        try:
+            validate(train_config, jsonfile2dict(config_filepath))
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    return sql_api.create_train_container(
+        db,
+        owner=user.username,
+        image_id=base.image_id,
+        repository=base.repository,
+        tag=base.tag,
+        last_modified=datetime.now(),
+        provider=base.provider,
+        category=base.category,
+        architecture=base.architecture,
+        dataset_id=base.dataset_id,
+        dataset=base.dataset,
+        model_filepath=base.model_filepath,
+        score_name=base.score_name,
+        score_regexp=base.score_regexp,
+        config_override=train_config,
+    )
+
+
 @router.get("/containers/{train_container_id}/model")
 async def get_train_container_model(
     request: Request, train_container_id: int, db: Session = Depends(get_db)
@@ -547,8 +681,16 @@ def delete_train_container(
     train_container = check_exists(sql_api.get_train_container(db, train_container_id))
     if train_container.container_id is not None:
         remove_container(train_container.container_id, force=True)
-    # Do not force remove images as they could be used by multiple containers
-    remove_image(train_container.image_id, force=False)
+    # Clones share the image of their base container: keep it while another row uses it.
+    image_shared = (
+        sql_api.count_train_containers_with_image(
+            db, train_container.image_id, exclude_id=train_container.id
+        )
+        > 0
+    )
+    if not image_shared:
+        # Do not force remove images as they could be used by multiple containers
+        remove_image(train_container.image_id, force=False)
     sql_api.delete_train_container(db, train_container)
     return Response(status_code=204)
 

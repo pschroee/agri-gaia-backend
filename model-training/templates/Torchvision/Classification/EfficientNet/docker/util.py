@@ -8,6 +8,7 @@
 # SPDX-FileContributor: Maik Fruhner
 # SPDX-FileContributor: Prof. Dr.-Ing. Heiko Tapken
 # SPDX-FileContributor: Tobias Wamhof
+# SPDX-FileContributor: Philipp Schröer
 #
 # SPDX-License-Identifier: MIT
 
@@ -27,6 +28,7 @@ from pytorch_lightning.callbacks import StochasticWeightAveraging
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pytorch_lightning.strategies import DDPStrategy
 from pytorch_lightning.tuner import Tuner
+from metrics_callback import JsonlMetrics
 from torchmetrics import MetricCollection, Accuracy, Precision, Recall, F1Score
 
 if TYPE_CHECKING:
@@ -70,7 +72,7 @@ def train_and_test_model(
             f"Automatically determining batch size using '{auto_scale_batch_size}' method."
         )
 
-    callbacks = []
+    callbacks = [JsonlMetrics()]
     if swa_lrs:
         assert swa_lrs > 0, "SWA learning rate has to be positive."
 
@@ -102,7 +104,6 @@ def train_and_test_model(
         max_epochs=epochs,
         accelerator="auto",
         devices="auto",
-        limit_val_batches=0,
         log_every_n_steps=1,
         strategy=configure_strategy(strategy),
         callbacks=callbacks,

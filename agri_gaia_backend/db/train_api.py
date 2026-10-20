@@ -8,13 +8,14 @@
 # SPDX-FileContributor: Maik Fruhner
 # SPDX-FileContributor: Prof. Dr.-Ing. Heiko Tapken
 # SPDX-FileContributor: Tobias Wamhof
+# SPDX-FileContributor: Philipp Schröer
 #
 # SPDX-License-Identifier: MIT
 
 # -*- coding: utf-8 -*-
 
 import datetime
-from typing import List
+from typing import Dict, List, Optional
 
 from agri_gaia_backend.db.models import TrainContainer, Dataset
 from sqlalchemy.orm import Session
@@ -35,6 +36,8 @@ def create_train_container(
     model_filepath: str,
     score_regexp: str,
     score_name: str,
+    score: Optional[float] = None,
+    config_override: Optional[Dict] = None,
 ) -> TrainContainer:
     db_train_container = TrainContainer(
         owner=owner,
@@ -50,6 +53,8 @@ def create_train_container(
         model_filepath=model_filepath,
         score_regexp=score_regexp,
         score_name=score_name,
+        score=score,
+        config_override=config_override,
     )
     db.add(db_train_container)
     db.commit()
@@ -86,3 +91,12 @@ def delete_train_container(db: Session, train_container: TrainContainer) -> bool
     db.delete(train_container)
     db.commit()
     return True
+
+
+def count_train_containers_with_image(
+    db: Session, image_id: str, exclude_id: Optional[int] = None
+) -> int:
+    query = db.query(TrainContainer).filter(TrainContainer.image_id == image_id)
+    if exclude_id is not None:
+        query = query.filter(TrainContainer.id != exclude_id)
+    return query.count()

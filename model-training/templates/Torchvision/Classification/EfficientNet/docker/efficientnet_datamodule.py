@@ -8,6 +8,7 @@
 # SPDX-FileContributor: Maik Fruhner
 # SPDX-FileContributor: Prof. Dr.-Ing. Heiko Tapken
 # SPDX-FileContributor: Tobias Wamhof
+# SPDX-FileContributor: Philipp Schröer
 #
 # SPDX-License-Identifier: MIT
 
@@ -64,6 +65,17 @@ class EfficientNetDataModule(pl.LightningDataModule):
     def train_dataloader(self) -> DataLoader:
         return DataLoader(
             self.train_split,
+            num_workers=self.num_workers,
+            batch_size=self.batch_size,
+            shuffle=False,
+            persistent_workers=True,
+            pin_memory=self.pin_memory,
+        )
+
+    def val_dataloader(self) -> DataLoader:
+        # Validation uses the same "val" split as testing.
+        return DataLoader(
+            self.test_split,
             num_workers=self.num_workers,
             batch_size=self.batch_size,
             shuffle=False,
