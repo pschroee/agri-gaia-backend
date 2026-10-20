@@ -71,6 +71,17 @@ class EfficientNetDataModule(pl.LightningDataModule):
             pin_memory=self.pin_memory,
         )
 
+    def val_dataloader(self) -> DataLoader:
+        # Validation uses the same "val" split as testing.
+        return DataLoader(
+            self.test_split,
+            num_workers=self.num_workers,
+            batch_size=self.batch_size,
+            shuffle=False,
+            persistent_workers=True,
+            pin_memory=self.pin_memory,
+        )
+
     def test_dataloader(self) -> DataLoader:
         return DataLoader(
             self.test_split,

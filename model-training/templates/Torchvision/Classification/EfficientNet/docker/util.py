@@ -102,7 +102,6 @@ def train_and_test_model(
         max_epochs=epochs,
         accelerator="auto",
         devices="auto",
-        limit_val_batches=0,
         log_every_n_steps=1,
         strategy=configure_strategy(strategy),
         callbacks=callbacks,
