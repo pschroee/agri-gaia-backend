@@ -681,8 +681,16 @@ def delete_train_container(
     train_container = check_exists(sql_api.get_train_container(db, train_container_id))
     if train_container.container_id is not None:
         remove_container(train_container.container_id, force=True)
-    # Do not force remove images as they could be used by multiple containers
-    remove_image(train_container.image_id, force=False)
+    # Clones share the image of their base container: keep it while another row uses it.
+    image_shared = (
+        sql_api.count_train_containers_with_image(
+            db, train_container.image_id, exclude_id=train_container.id
+        )
+        > 0
+    )
+    if not image_shared:
+        # Do not force remove images as they could be used by multiple containers
+        remove_image(train_container.image_id, force=False)
     sql_api.delete_train_container(db, train_container)
     return Response(status_code=204)
 
