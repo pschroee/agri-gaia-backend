@@ -27,6 +27,7 @@ from util import (
 )
 
 from export import export_model
+from metrics_callback import mark_saved
 
 if __name__ == "__main__":
     ARGS = get_args()
@@ -82,3 +83,5 @@ if __name__ == "__main__":
         model_format="pytorch",
         default_model_export_func=save_model,
     )
+
+    mark_saved()

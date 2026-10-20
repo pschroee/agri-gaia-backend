@@ -15,6 +15,8 @@ ARG DEBIAN_FRONTEND=noninteractive
 
 ENV TZ=Europe/Berlin
 
+LABEL agrigaia.metrics="jsonl/1"
+
 COPY docker-entrypoint.sh /docker-entrypoint.sh
 RUN chmod +x /docker-entrypoint.sh
 
@@ -38,7 +40,7 @@ RUN mkdir lightning_logs
 COPY config_to_args.py config.py dataset.py cvat_dataset.py export.py ./
 
 COPY train.py args.py util.py setup.py efficientnet.py efficientnet_dataset.py \
-  efficientnet_datamodule.py requirements.txt train_config.json presets.json export_config.json ./
+  efficientnet_datamodule.py metrics_callback.py requirements.txt train_config.json presets.json export_config.json ./
 
 # Wheel index auto-selected from host GPUs by the backend (build arg).
 # Default cu126 covers CC 7.0-9.0 (incl. Volta V100) for manual builds / detection failure.
