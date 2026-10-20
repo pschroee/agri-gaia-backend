@@ -9,6 +9,7 @@
 #
 # SPDX-License-Identifier: MIT
 
+import inspect
 import io
 import mimetypes
 from zipfile import ZipFile
@@ -78,6 +79,8 @@ class TaskCreator:
                             on_error (str -> None): which should be called if an error occurs.
                                                     The given message will be displayed in the task and
                                                     the task will be marked as failed.
+                            on_message (str -> None): optional, passed only if func declares it. Sets the
+                                                    task message, kept when the task completes.
             args: positional arguments given to func
             kwargs: keyword arguments given to func
 
@@ -99,16 +102,26 @@ class TaskCreator:
                 nonlocal task_execution_failed
                 task_execution_failed = True
 
+            def on_message(message: str) -> None:
+                task.message = message
+                tasks_api.update_task(db, task)
+
             error_message = "Task failed. See backend logs for details."
             task_execution_failed = False
             try:
                 task.status = TaskStatus.inprogress
                 tasks_api.update_task(db, task)
+                extra = (
+                    {"on_message": on_message}
+                    if "on_message" in inspect.signature(func).parameters
+                    else {}
+                )
                 try:
                     func(
                         *args,
                         on_progress_change=task_progress_change_handler,
                         on_error=on_error,
+                        **extra,
                         **kwargs,
                     )
                 except NotImplementedError:

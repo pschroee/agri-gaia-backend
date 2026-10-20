@@ -93,6 +93,10 @@ logger = logging.getLogger("api-logger")
 router = APIRouter(prefix=ROOT_PATH)
 
 
+def train_container_created_message(train_container_id: int) -> str:
+    return f"Train Container #{train_container_id} created."
+
+
 def build_train_image(
     on_error,
     on_progress_change,
@@ -105,6 +109,7 @@ def build_train_image(
     export_config: Optional[Dict],
     train_configs_path: str,
     owner: str,
+    on_message=None,
 ) -> None:
     try:
         dataset = check_exists(
@@ -172,7 +177,7 @@ def build_train_image(
                 "model_filepath", "score_name", "score_regexp"
             )(json.load(fh))
 
-        sql_api.create_train_container(
+        train_container = sql_api.create_train_container(
             db,
             owner=owner,
             image_id=image_id,
@@ -188,6 +193,8 @@ def build_train_image(
             score_name=score_name,
             score_regexp=score_regexp,
         )
+        if on_message:
+            on_message(train_container_created_message(train_container.id))
 
         # Warm the image on the host while no user token is involved. The run
         # task only has the user's access token, which lives 300 s, and a cold
