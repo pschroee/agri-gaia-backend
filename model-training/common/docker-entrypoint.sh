@@ -27,6 +27,9 @@ tree "/minio/datasets/${DATASET_ID}"
 
 if command -v nvidia-smi &> /dev/null && nvidia-smi -L > /dev/null 2>&1; then
   nvidia-smi -L
+  # Sample GPU usage every 5 s; the backend serves the file through the metrics route.
+  mkdir -p /train
+  nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits -l 5 >> /train/gpu.csv 2>/dev/null &
 fi
 
 DATETIME_FORMAT="%Y-%m-%dT%H:%M:%S"
