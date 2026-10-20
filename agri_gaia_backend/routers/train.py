@@ -41,6 +41,11 @@ from agri_gaia_backend.routers.common import (
     get_task_creator,
 )
 from agri_gaia_backend.util.common import gpu_available, get_torch_cuda_index
+from agri_gaia_backend.util.train_metrics import (
+    metrics_supported,
+    parse_gpu_csv,
+    parse_metrics_jsonl,
+)
 from agri_gaia_backend.routers.datasets import update_annotations_from_cvat
 from agri_gaia_backend.routers.models import persist_model, persist_model_artifact
 from agri_gaia_backend.schemas.keycloak_user import KeycloakUser
@@ -463,6 +468,50 @@ def get_train_containers(
 @router.get("/containers/{train_container_id}")
 def get_train_container(train_container_id: int, db: Session = Depends(get_db)) -> Dict:
     return check_exists(sql_api.get_train_container(db, train_container_id))
+
+
+@router.get("/containers/{train_container_id}/metrics")
+def get_train_container_metrics(
+    train_container_id: int, db: Session = Depends(get_db)
+) -> Dict:
+    """Epoch figures (metrics.jsonl) and GPU samples (gpu.csv) of a training container.
+
+    Readable while the container runs and after it exited. Containers built from images
+    without the label agrigaia.metrics answer with supported=false and no rows.
+    """
+    train_container = check_exists(sql_api.get_train_container(db, train_container_id))
+
+    container = None
+    labels = None
+    if train_container.container_id is not None and container_exists(
+        train_container.container_id
+    ):
+        container = get_container(train_container.container_id)
+        try:
+            labels = container.image.labels
+        except Exception:
+            labels = None
+    if labels is None:
+        try:
+            labels = docker_host_client.images.get(train_container.image_id).labels
+        except Exception:
+            labels = None
+
+    result = {
+        "supported": metrics_supported(labels),
+        "epochs": [],
+        "gpu": [],
+        "gpu_available": False,
+    }
+    if container is None or not result["supported"]:
+        return result
+
+    result["epochs"] = parse_metrics_jsonl(
+        read_from_container(container.id, "/train/metrics.jsonl")
+    )
+    result["gpu"] = parse_gpu_csv(read_from_container(container.id, "/train/gpu.csv"))
+    result["gpu_available"] = bool(result["gpu"])
+    return result
 
 
 @router.get("/containers/{train_container_id}/model")
