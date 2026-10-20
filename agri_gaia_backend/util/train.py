@@ -407,6 +407,11 @@ def read_from_container(container_id: str, container_filepath: str) -> bytes:
             return fh.read()
 
 
+def merge_train_config(base: Dict, override: Dict) -> bytes:
+    """train_config.json of a clone: the config baked into the image, overridden by the clone's values."""
+    return json.dumps({**base, **override}, indent=4).encode("utf-8")
+
+
 def read_train_container_files(
     container_id: str,
     templates_path: str,

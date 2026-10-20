@@ -77,6 +77,9 @@ from agri_gaia_backend.util.train import (
     update_train_container_config,
     update_train_container_dataset,
     read_train_container_config,
+    merge_train_config,
+    get_config_container_filepath,
+    TRAIN_CONFIG_FILENAME,
 )
 from docker.types import DeviceRequest, Ulimit
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status, Form
@@ -221,6 +224,20 @@ def build_train_image(
         on_error(error_msg)
 
 
+def _clone_config_files(container_id: str, train_container) -> Dict[str, bytes]:
+    config_filepath = str(
+        get_config_container_filepath(
+            config_filename=TRAIN_CONFIG_FILENAME,
+            templates_path=TEMPLATES_PATH,
+            provider=train_container.provider,
+            architecture=train_container.architecture,
+        )
+    )
+    base_data = read_from_container(container_id, config_filepath)
+    base = json.loads(base_data.decode("utf-8")) if base_data else {}
+    return {config_filepath: merge_train_config(base, train_container.config_override)}
+
+
 @router.post("/containers/{train_container_id}/run")
 async def run_train_container(
     request: Request,
@@ -280,6 +297,7 @@ async def run_train_container(
             # Configuration edits and trained models live only in the old
             # container's filesystem. Keep them across the recreation.
             preserved_files = {}
+            first_run = train_container.container_id is None
             if train_container.container_id is not None:
                 preserved_files = read_train_container_files(
                     container_id=train_container.container_id,
@@ -340,6 +358,13 @@ async def run_train_container(
                 run_parameters["environment"]["NVIDIA_VISIBLE_DEVICES"] = "all"
 
             container = docker_host_client.containers.create(**run_parameters)
+            if first_run and train_container.config_override:
+                # A clone has no container yet: its train_config is the one baked into
+                # the image, overridden by the values given at clone time.
+                preserved_files = {
+                    **preserved_files,
+                    **_clone_config_files(container.id, train_container),
+                }
             write_train_container_files(container.id, preserved_files)
             container.start()
             train_container.container_id = container.id
@@ -512,6 +537,65 @@ def get_train_container_metrics(
     result["gpu"] = parse_gpu_csv(read_from_container(container.id, "/train/gpu.csv"))
     result["gpu_available"] = bool(result["gpu"])
     return result
+
+
+@router.post(
+    "/containers/{train_container_id}/clone",
+    status_code=status.HTTP_201_CREATED,
+    response_model=TrainContainer,
+)
+async def clone_train_container(
+    request: Request, train_container_id: int, db: Session = Depends(get_db)
+) -> TrainContainer:
+    """Creates a copy of a built training container with another train_config.
+
+    The copy uses the same image (no build). It gets its own container on the first run.
+    Body: {"train_config": {...}}, the complete configuration; nothing else is accepted.
+    """
+    user: KeycloakUser = request.user
+    base = check_exists(sql_api.get_train_container(db, train_container_id))
+
+    try:
+        data = await request.json()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Body is not valid JSON.")
+    if (
+        not isinstance(data, dict)
+        or set(data) != {"train_config"}
+        or not isinstance(data["train_config"], dict)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Body must be a JSON object with the single key 'train_config'.",
+        )
+    train_config = data["train_config"]
+
+    config_filepath, ext = get_config_filepath(
+        TEMPLATES_PATH, base.provider, base.architecture
+    )
+    if ext == ".jsonschema":
+        try:
+            validate(train_config, jsonfile2dict(config_filepath))
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    return sql_api.create_train_container(
+        db,
+        owner=user.username,
+        image_id=base.image_id,
+        repository=base.repository,
+        tag=base.tag,
+        last_modified=datetime.now(),
+        provider=base.provider,
+        category=base.category,
+        architecture=base.architecture,
+        dataset_id=base.dataset_id,
+        dataset=base.dataset,
+        model_filepath=base.model_filepath,
+        score_name=base.score_name,
+        score_regexp=base.score_regexp,
+        config_override=train_config,
+    )
 
 
 @router.get("/containers/{train_container_id}/model")
