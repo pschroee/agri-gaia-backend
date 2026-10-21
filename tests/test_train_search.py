@@ -296,3 +296,44 @@ class TestMetricsRoute:
             authenticated_client.get("/train/containers/999999999/metrics").status_code
             == 404
         )
+
+
+class TestConfigBeforeFirstRun:
+    """A built container that was never run has no Docker container; its settings come from the image."""
+
+    def test_reads_the_image_through_a_scratch_container_and_applies_the_override(
+        self, authenticated_client: TestClient, base_container, db: Session, monkeypatch
+    ):
+        base_container.config_override = {"epochs": 7}
+        train_api.update_train_container(db, base_container)
+        removed = []
+        scratch = types.SimpleNamespace(
+            id="scratch1", remove=lambda force=False: removed.append(force)
+        )
+        created = []
+
+        class _Containers:
+            def create(self, **kwargs):
+                created.append(kwargs)
+                return scratch
+
+        monkeypatch.setattr(
+            train_router,
+            "docker_host_client",
+            types.SimpleNamespace(containers=_Containers()),
+        )
+        seen = []
+
+        def fake_read(config_filename, train_container, templates_path):
+            seen.append(train_container.container_id)
+            return {"epochs": 3, "batch-size": 16} if "train" in config_filename else {}
+
+        monkeypatch.setattr(train_router, "read_train_container_config", fake_read)
+        response = authenticated_client.get(
+            f"/train/containers/{base_container.id}/config"
+        )
+        assert response.status_code == HTTP_200_OK, response.text
+        assert created == [{"image": base_container.image_id}]
+        assert set(seen) == {"scratch1"} and removed == [True]
+        values = response.json()["config"]["train"]["values"]
+        assert values.get("epochs") == 7
