@@ -19,6 +19,7 @@ import os
 import re
 import glob
 import json
+import types
 import logging
 import tempfile
 import zipfile
@@ -743,12 +744,46 @@ def get_train_container_config(
 ) -> Dict:
     train_container = check_exists(sql_api.get_train_container(db, train_container_id))
 
+    # A container that was built but never run (and every clone) has no Docker container yet: its
+    # settings are the ones baked into the image. Read them from a short-lived stopped container.
+    scratch = None
+    reader = train_container
     if train_container.container_id is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No Train Container '{train_container.container_id}' found.",
+        try:
+            scratch = docker_host_client.containers.create(image=train_container.image_id)
+        except Exception as e:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No Train Container found and the image could not be opened: {e}",
+            )
+        reader = types.SimpleNamespace(
+            container_id=scratch.id,
+            provider=train_container.provider,
+            architecture=train_container.architecture,
         )
 
+    try:
+        config_obj = _read_config_obj(train_container, reader)
+    finally:
+        if scratch is not None:
+            try:
+                scratch.remove(force=True)
+            except Exception as e:
+                logger.error(f"Unable to remove scratch container {scratch.id}: {e}")
+
+    return {
+        "container_id": train_container_id,
+        "config": config_obj,
+        "provider": train_container.provider,
+        "architecture": {
+            "category": train_container.category,
+            "name": train_container.architecture,
+        },
+        "dataset_id": train_container.dataset_id,
+    }
+
+
+def _read_config_obj(train_container, reader) -> Dict:
     config_obj = {}
     for config_filename, config_key in [
         ("train_config.json", "train"),
@@ -756,9 +791,11 @@ def get_train_container_config(
     ]:
         config_json = read_train_container_config(
             config_filename=config_filename,
-            train_container=train_container,
+            train_container=reader,
             templates_path=TEMPLATES_PATH,
         )
+        if config_key == "train" and train_container.config_override:
+            config_json = {**config_json, **train_container.config_override}
 
         if config_key == "train":
             schema_with_values = get_train_config_for_architecture(
@@ -774,16 +811,7 @@ def get_train_container_config(
             "empty": not config_json,
         }
 
-    return {
-        "container_id": train_container_id,
-        "config": config_obj,
-        "provider": train_container.provider,
-        "architecture": {
-            "category": train_container.category,
-            "name": train_container.architecture,
-        },
-        "dataset_id": train_container.dataset_id,
-    }
+    return config_obj
 
 
 @router.get("/providers")
