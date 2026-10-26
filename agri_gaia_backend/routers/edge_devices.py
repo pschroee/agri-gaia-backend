@@ -6,6 +6,7 @@
 # SPDX-FileContributor: Maik Fruhner
 # SPDX-FileContributor: Prof. Dr.-Ing. Heiko Tapken
 # SPDX-FileContributor: Tobias Wamhof
+# SPDX-FileContributor: Philipp Schröer
 #
 # SPDX-License-Identifier: MIT
 
@@ -13,11 +14,12 @@ import logging
 import datetime
 
 from typing import List
+import requests
 from requests.exceptions import HTTPError
 from fastapi import APIRouter, Depends, Response, status
 from fastapi.exceptions import HTTPException
 from sqlalchemy.orm import Session
-from agri_gaia_backend.schemas.edge_device import EdgeDevice, EdgeDeviceCreate
+from agri_gaia_backend.schemas.edge_device import EdgeContainer, EdgeDevice, EdgeDeviceCreate
 from agri_gaia_backend.schemas.container_deployment import ContainerDeployment
 from agri_gaia_backend.routers.common import check_exists, get_db
 from agri_gaia_backend.db import (
@@ -95,6 +97,21 @@ def get_container_deployments_for_edge_device(
         sql_api.get_edge_device(db, edge_device_id)
     )
     return edge_device.container_deployments
+
+
+@router.get("/{edge_device_id}/containers", response_model=List[EdgeContainer])
+def get_containers_on_edge_device(
+    edge_device_id: int, db: Session = Depends(get_db)
+) -> List[EdgeContainer]:
+    edge_device: models.EdgeDevice = check_exists(
+        sql_api.get_edge_device(db, edge_device_id)
+    )
+    if not edge_device.registered:
+        raise HTTPException(status_code=409, detail="Edge Device is not registered!")
+    try:
+        return portainer.list_containers(edge_device.portainer_id)
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Portainer: {e}")
 
 
 @router.post("", response_model=EdgeDevice, status_code=status.HTTP_201_CREATED)
