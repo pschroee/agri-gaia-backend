@@ -15,7 +15,6 @@ import json
 import logging
 from random import randbytes
 import time
-import traceback
 import numpy as np
 from io import BytesIO
 from PIL import Image
@@ -28,8 +27,8 @@ from agri_gaia_backend.db.database import SessionLocal
 from agri_gaia_backend.routers.common import (
     TaskCreator,
     check_exists,
-    get_db,
     get_task_creator,
+    task_error_message,
 )
 from agri_gaia_backend.schemas.keycloak_user import KeycloakUser
 from agri_gaia_backend.services import minio_api
