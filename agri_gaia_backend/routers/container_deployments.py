@@ -17,6 +17,7 @@ from fastapi import APIRouter, HTTPException, Depends, Response, status
 
 from sqlalchemy.orm import Session
 
+from agri_gaia_backend.db.database import SessionLocal
 from agri_gaia_backend.db.models import ContainerDeploymentStatus
 
 from agri_gaia_backend.schemas.container_image import ContainerImage
@@ -37,7 +38,10 @@ from agri_gaia_backend.db import container_deployment_api as sql_api
 from agri_gaia_backend.db import container_api as sql_container_api
 from agri_gaia_backend.db import edge_device_api as sql_edge_device_api
 
-from agri_gaia_backend.services.portainer.portainer_api import portainer
+from agri_gaia_backend.services.portainer.portainer_api import (
+    portainer,
+    DeploymentStartError,
+)
 
 
 import logging
@@ -118,36 +122,52 @@ def deploy_container(
     )
 
     def deploy_task(container_deployment_id: int, on_error, **kwargs):
-        container_deployment: ContainerDeployment = check_exists(
-            sql_api.get_container_deployment(db, container_deployment_id)
-        )
-
-        container_image: ContainerImage = check_exists(
-            sql_container_api.get_container_image(
-                db, container_deployment.container_image_id
-            )
-        )
-
-        edge_device: EdgeDevice = check_exists(
-            sql_edge_device_api.get_edge_device(db, container_deployment.edge_device_id)
-        )
-        try:
-            container_id = portainer.deploy_container_to_edge_device(
-                edge_device, container_image, container_deployment
+        # The task runs in another thread than the request. It therefore opens its
+        # own session: the request session is closed as soon as the response is sent.
+        with SessionLocal() as task_db:
+            container_deployment: ContainerDeployment = check_exists(
+                sql_api.get_container_deployment(task_db, container_deployment_id)
             )
 
-            logger.debug("Container ID:")
-            logger.debug(container_id)
-
-            # update the deployment status in db
-            container_deployment.status = ContainerDeploymentStatus.deployed
-            container_deployment.docker_container_id = container_id
-            container_deployment = sql_api.update_container_deployment(
-                db, container_deployment
+            container_image: ContainerImage = check_exists(
+                sql_container_api.get_container_image(
+                    task_db, container_deployment.container_image_id
+                )
             )
-        except requests.HTTPError as e:
-            logger.error("Portainer Deploy Failed!")
-            on_error(str(e))
+
+            edge_device: EdgeDevice = check_exists(
+                sql_edge_device_api.get_edge_device(
+                    task_db, container_deployment.edge_device_id
+                )
+            )
+            try:
+                container_id = portainer.deploy_container_to_edge_device(
+                    edge_device, container_image, container_deployment
+                )
+
+                logger.debug("Container ID:")
+                logger.debug(container_id)
+
+                # update the deployment status in db
+                container_deployment.status = ContainerDeploymentStatus.deployed
+                container_deployment.docker_container_id = container_id
+                container_deployment = sql_api.update_container_deployment(
+                    task_db, container_deployment
+                )
+            except DeploymentStartError as e:
+                logger.error("Portainer Deploy Failed: %s", e.message)
+                if e.container_id:
+                    # the container stays on the device; keep its id so that it
+                    # can be removed with undeploy
+                    container_deployment.docker_container_id = e.container_id
+                    sql_api.update_container_deployment(task_db, container_deployment)
+                on_error(e.message)
+            except HTTPException as e:
+                logger.error("Portainer Deploy Failed: %s", e.detail)
+                on_error(str(e.detail))
+            except requests.HTTPError as e:
+                logger.error("Portainer Deploy Failed!")
+                on_error(str(e))
 
     _, task_location_url, _ = task_creator.create_background_task(
         deploy_task,
@@ -174,28 +194,32 @@ def undeploy_container(
     )
 
     def undeploy_task(container_deployment_id: int, on_error, **kwargs):
-        container_deployment: ContainerDeployment = check_exists(
-            sql_api.get_container_deployment(db, container_deployment_id)
-        )
-
-        edge_device: EdgeDevice = check_exists(
-            sql_edge_device_api.get_edge_device(db, container_deployment.edge_device_id)
-        )
-        try:
-            portainer.undeploy_container_from_edge_device(
-                edge_device, container_deployment
+        # own session, see deploy_task
+        with SessionLocal() as task_db:
+            container_deployment: ContainerDeployment = check_exists(
+                sql_api.get_container_deployment(task_db, container_deployment_id)
             )
-        except HTTPException as e:
-            # keep the deployment, but tell the user why it could not be removed
-            on_error(str(e.detail))
-            raise
 
-        # update the deployment status in db
-        container_deployment.status = ContainerDeploymentStatus.undeployed
-        container_deployment.docker_container_id = None
-        container_deployment = sql_api.update_container_deployment(
-            db, container_deployment
-        )
+            edge_device: EdgeDevice = check_exists(
+                sql_edge_device_api.get_edge_device(
+                    task_db, container_deployment.edge_device_id
+                )
+            )
+            try:
+                portainer.undeploy_container_from_edge_device(
+                    edge_device, container_deployment
+                )
+            except HTTPException as e:
+                # keep the deployment, but tell the user why it could not be removed
+                on_error(str(e.detail))
+                raise
+
+            # update the deployment status in db
+            container_deployment.status = ContainerDeploymentStatus.undeployed
+            container_deployment.docker_container_id = None
+            container_deployment = sql_api.update_container_deployment(
+                task_db, container_deployment
+            )
 
     _, task_location_url, _ = task_creator.create_background_task(
         undeploy_task,
