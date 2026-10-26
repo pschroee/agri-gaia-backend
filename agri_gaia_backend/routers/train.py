@@ -31,6 +31,7 @@ from typing import Dict, List, Optional
 from itertools import chain
 
 from agri_gaia_backend.db import dataset_api as dataset_sql_api
+from agri_gaia_backend.db.database import SessionLocal
 from agri_gaia_backend.db import train_api as sql_api
 from agri_gaia_backend.db.models import Dataset
 from agri_gaia_backend.schemas.model import Model
@@ -40,6 +41,7 @@ from agri_gaia_backend.routers.common import (
     create_single_file_response,
     get_db,
     get_task_creator,
+    task_error_message,
 )
 from agri_gaia_backend.util.common import gpu_available, get_torch_cuda_index
 from agri_gaia_backend.util.train_metrics import (
@@ -111,7 +113,6 @@ def train_container_created_message(train_container_id: int) -> str:
 def build_train_image(
     on_error,
     on_progress_change,
-    db: Session,
     provider: str,
     category: str,
     architecture: str,
@@ -123,107 +124,106 @@ def build_train_image(
     on_message=None,
 ) -> None:
     try:
-        dataset = check_exists(
-            dataset_sql_api.get_dataset(db, dataset_id),
-            detail=f"Dataset with id '{dataset_id}' does not exist.",
-        )
-
-        with tempfile.TemporaryDirectory() as context_directory:
-            copy_tree(COMMON_PATH, context_directory)
-            copy_tree(DATASETS_PATH, context_directory)
-
-            dockerfile_filepath = get_dockerfile_filepath(
-                TEMPLATES_PATH, provider, architecture
+        # The task runs in another thread than the request. It therefore opens
+        # its own session: the request session is closed as soon as the
+        # response is sent.
+        with SessionLocal() as task_db:
+            dataset = check_exists(
+                dataset_sql_api.get_dataset(task_db, dataset_id),
+                detail=f"Dataset with id '{dataset_id}' does not exist.",
             )
-            copy_tree(os.path.dirname(dockerfile_filepath), context_directory)
-            for config_filename in ("custom.json", "presets.json"):
-                copy(
-                    os.path.join(train_configs_path, config_filename), context_directory
+
+            with tempfile.TemporaryDirectory() as context_directory:
+                copy_tree(COMMON_PATH, context_directory)
+                copy_tree(DATASETS_PATH, context_directory)
+
+                dockerfile_filepath = get_dockerfile_filepath(
+                    TEMPLATES_PATH, provider, architecture
                 )
-            copy(os.path.join(EXPORT_PATH, "export.py"), context_directory)
+                copy_tree(os.path.dirname(dockerfile_filepath), context_directory)
+                for config_filename in ("custom.json", "presets.json"):
+                    copy(
+                        os.path.join(train_configs_path, config_filename), context_directory
+                    )
+                copy(os.path.join(EXPORT_PATH, "export.py"), context_directory)
 
-            with open(
-                os.path.join(context_directory, "train_config.json"),
-                "w",
-            ) as fh:
-                json.dump(train_config, fh)
+                with open(
+                    os.path.join(context_directory, "train_config.json"),
+                    "w",
+                ) as fh:
+                    json.dump(train_config, fh)
 
-            with open(
-                os.path.join(context_directory, "export_config.json"),
-                "w",
-            ) as fh:
-                if not export_config:
-                    export_config = {}
-                json.dump(export_config, fh)
+                with open(
+                    os.path.join(context_directory, "export_config.json"),
+                    "w",
+                ) as fh:
+                    if not export_config:
+                        export_config = {}
+                    json.dump(export_config, fh)
 
-            image_name = f"{provider}-{architecture.replace(' ', '_')}".lower()
-            repository_url = (
-                image_builder.create_repository_url(owner) + f"/{image_name}"
+                image_name = f"{provider}-{architecture.replace(' ', '_')}".lower()
+                repository_url = (
+                    image_builder.create_repository_url(owner) + f"/{image_name}"
+                )
+                image_tag = datetime.now().strftime("%Y-%m-%dT%H-%M-%S") + "-train"
+
+                torch_cuda_index = get_torch_cuda_index()
+                build_kwargs = (
+                    {"build_args": {"TORCH_CUDA_INDEX": torch_cuda_index}}
+                    if torch_cuda_index
+                    else {}
+                )
+
+                image_builder._build_and_push_image(
+                    context_directory=context_directory,
+                    repository_url=repository_url,
+                    image_tag=image_tag,
+                    platforms=["linux/amd64"],
+                    status_callback=lambda type, info: logger.info(
+                        f"{type}: {json.dumps(info)}"
+                    ),
+                    **build_kwargs,
+                )
+
+            image_id = f"{repository_url}:{image_tag}"
+
+            custom_config_filepath = os.path.join(train_configs_path, "custom.json")
+            with open(custom_config_filepath, "r") as fh:
+                model_filepath, score_name, score_regexp = itemgetter(
+                    "model_filepath", "score_name", "score_regexp"
+                )(json.load(fh))
+
+            train_container = sql_api.create_train_container(
+                task_db,
+                owner=owner,
+                image_id=image_id,
+                repository=f"{owner}/{image_name}",
+                tag=image_tag,
+                last_modified=datetime.now(),
+                provider=provider,
+                category=category,
+                architecture=architecture,
+                dataset_id=dataset_id,
+                dataset=dataset,
+                model_filepath=model_filepath,
+                score_name=score_name,
+                score_regexp=score_regexp,
             )
-            image_tag = datetime.now().strftime("%Y-%m-%dT%H-%M-%S") + "-train"
+            if on_message:
+                on_message(train_container_created_message(train_container.id))
 
-            torch_cuda_index = get_torch_cuda_index()
-            build_kwargs = (
-                {"build_args": {"TORCH_CUDA_INDEX": torch_cuda_index}}
-                if torch_cuda_index
-                else {}
-            )
-
-            image_builder._build_and_push_image(
-                context_directory=context_directory,
-                repository_url=repository_url,
-                image_tag=image_tag,
-                platforms=["linux/amd64"],
-                status_callback=lambda type, info: logger.info(
-                    f"{type}: {json.dumps(info)}"
-                ),
-                **build_kwargs,
-            )
-
-        image_id = f"{repository_url}:{image_tag}"
-
-        custom_config_filepath = os.path.join(train_configs_path, "custom.json")
-        with open(custom_config_filepath, "r") as fh:
-            model_filepath, score_name, score_regexp = itemgetter(
-                "model_filepath", "score_name", "score_regexp"
-            )(json.load(fh))
-
-        train_container = sql_api.create_train_container(
-            db,
-            owner=owner,
-            image_id=image_id,
-            repository=f"{owner}/{image_name}",
-            tag=image_tag,
-            last_modified=datetime.now(),
-            provider=provider,
-            category=category,
-            architecture=architecture,
-            dataset_id=dataset_id,
-            dataset=dataset,
-            model_filepath=model_filepath,
-            score_name=score_name,
-            score_regexp=score_regexp,
-        )
-        if on_message:
-            on_message(train_container_created_message(train_container.id))
-
-        # Warm the image on the host while no user token is involved. The run
-        # task only has the user's access token, which lives 300 s, and a cold
-        # pull takes minutes; pulling here keeps the token valid until the
-        # container starts. A failure must not fail the build: the run task
-        # pulls as a fallback.
-        try:
-            pull_image_if_missing(image_id)
-        except Exception as e:
-            logger.error(f"Unable to pull train image '{image_id}' to the host: {e}")
-    except HTTPException as e:
-        error_msg = str(e.detail)
-        logger.error(error_msg)
-        on_error(error_msg)
+            # Warm the image on the host while no user token is involved. The run
+            # task only has the user's access token, which lives 300 s, and a cold
+            # pull takes minutes; pulling here keeps the token valid until the
+            # container starts. A failure must not fail the build: the run task
+            # pulls as a fallback.
+            try:
+                pull_image_if_missing(image_id)
+            except Exception as e:
+                logger.error(f"Unable to pull train image '{image_id}' to the host: {e}")
     except Exception as e:
-        error_msg = str(e)
-        logger.error(error_msg)
-        on_error(error_msg)
+        logger.exception("Build of train image failed")
+        on_error(task_error_message(e))
 
 
 def _clone_config_files(container_id: str, train_container) -> Dict[str, bytes]:
@@ -265,124 +265,127 @@ async def run_train_container(
     def _run_train_container(
         on_error,
         on_progress_change,
-        db: Session,
         user: KeycloakUser,
         train_container_id: int,
     ) -> None:
         try:
-            train_container: TrainContainer = check_exists(
-                sql_api.get_train_container(db, train_container_id)
-            )
-
-            dataset: Dataset = check_exists(
-                dataset_sql_api.get_dataset(db, train_container.dataset_id)
-            )
-
-            if (
-                train_container.container_id is not None
-                and container_exists(train_container.container_id)
-                and get_container(train_container.container_id).status == "running"
-            ):
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"Train Container #{train_container_id} is already running.",
+            # The task runs in another thread than the request. It therefore opens
+            # its own session: the request session is closed as soon as the
+            # response is sent.
+            with SessionLocal() as task_db:
+                train_container: TrainContainer = check_exists(
+                    sql_api.get_train_container(task_db, train_container_id)
                 )
 
-            # The access token is written into the container environment at
-            # creation time and Docker cannot change the environment of an
-            # existing container. Pulling a cold image can take longer than the
-            # token lives (300 s), so pull first and only then create a fresh
-            # container with the token from this request. A container left over
-            # from an earlier run still carries the token of that run.
-            pull_image_if_missing(train_container.image_id)
-
-            # Configuration edits and trained models live only in the old
-            # container's filesystem. Keep them across the recreation.
-            preserved_files = {}
-            first_run = train_container.container_id is None
-            if train_container.container_id is not None:
-                preserved_files = read_train_container_files(
-                    container_id=train_container.container_id,
-                    templates_path=TEMPLATES_PATH,
-                    provider=train_container.provider,
-                    architecture=train_container.architecture,
-                    extra_filepaths=(
-                        train_container.model_filepath,
-                        get_onnx_model_filepath(train_container.model_filepath),
-                    ),
+                dataset: Dataset = check_exists(
+                    dataset_sql_api.get_dataset(task_db, train_container.dataset_id)
                 )
-                remove_container(train_container.container_id, force=True)
-                train_container.container_id = None
-                sql_api.update_train_container(db, train_container)
 
-            run_parameters = {
-                "image": train_container.image_id,
-                "environment": {
-                    "OID_ACCESS_TOKEN": user.access_token,
-                    "S3_HOST": "http://minio:9000",
-                    "S3_BUCKET_NAME": train_container.dataset.bucket_name,
-                    "DATASET_ID": dataset.id,
-                },
-                "network": f"{os.environ.get('PROJECT_NAME')}_network",
-                "privileged": True,
-                "cap_add": ["SYS_ADMIN"],
-                "devices": ["/dev/fuse:/dev/fuse"],
-                "detach": True,
-                "ipc_mode": "host",
-                "ulimits": [
-                    Ulimit(name="memlock", soft=-1, hard=-1),
-                    Ulimit(name="stack", soft=67108864, hard=67108864),
-                ],
-            }
-
-            if gpu_available():
-                # See: https://github.com/docker/docker-py/blob/82cf559b5a641f53e9035b44b91f829f3b4cca80/docker/types/containers.py
-                gpu_device_ids = os.getenv("GPUS")
-                gpu_device_request = (
-                    DeviceRequest(
-                        name="nvidia",
-                        device_ids=[gpu_device_ids],
-                        capabilities=[["gpu"]],
+                if (
+                    train_container.container_id is not None
+                    and container_exists(train_container.container_id)
+                    and get_container(train_container.container_id).status == "running"
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"Train Container #{train_container_id} is already running.",
                     )
-                    if (
-                        gpu_device_ids
-                        and gpu_device_ids != "all"
-                        and all(
-                            map(lambda x: x.isdigit(), gpu_device_ids.split(","))
+
+                # The access token is written into the container environment at
+                # creation time and Docker cannot change the environment of an
+                # existing container. Pulling a cold image can take longer than the
+                # token lives (300 s), so pull first and only then create a fresh
+                # container with the token from this request. A container left over
+                # from an earlier run still carries the token of that run.
+                pull_image_if_missing(train_container.image_id)
+
+                # Configuration edits and trained models live only in the old
+                # container's filesystem. Keep them across the recreation.
+                preserved_files = {}
+                first_run = train_container.container_id is None
+                if train_container.container_id is not None:
+                    preserved_files = read_train_container_files(
+                        container_id=train_container.container_id,
+                        templates_path=TEMPLATES_PATH,
+                        provider=train_container.provider,
+                        architecture=train_container.architecture,
+                        extra_filepaths=(
+                            train_container.model_filepath,
+                            get_onnx_model_filepath(train_container.model_filepath),
+                        ),
+                    )
+                    remove_container(train_container.container_id, force=True)
+                    train_container.container_id = None
+                    sql_api.update_train_container(task_db, train_container)
+
+                run_parameters = {
+                    "image": train_container.image_id,
+                    "environment": {
+                        "OID_ACCESS_TOKEN": user.access_token,
+                        "S3_HOST": "http://minio:9000",
+                        "S3_BUCKET_NAME": train_container.dataset.bucket_name,
+                        "DATASET_ID": dataset.id,
+                    },
+                    "network": f"{os.environ.get('PROJECT_NAME')}_network",
+                    "privileged": True,
+                    "cap_add": ["SYS_ADMIN"],
+                    "devices": ["/dev/fuse:/dev/fuse"],
+                    "detach": True,
+                    "ipc_mode": "host",
+                    "ulimits": [
+                        Ulimit(name="memlock", soft=-1, hard=-1),
+                        Ulimit(name="stack", soft=67108864, hard=67108864),
+                    ],
+                }
+
+                if gpu_available():
+                    # See: https://github.com/docker/docker-py/blob/82cf559b5a641f53e9035b44b91f829f3b4cca80/docker/types/containers.py
+                    gpu_device_ids = os.getenv("GPUS")
+                    gpu_device_request = (
+                        DeviceRequest(
+                            name="nvidia",
+                            device_ids=[gpu_device_ids],
+                            capabilities=[["gpu"]],
+                        )
+                        if (
+                            gpu_device_ids
+                            and gpu_device_ids != "all"
+                            and all(
+                                map(lambda x: x.isdigit(), gpu_device_ids.split(","))
+                            )
+                        )
+                        else DeviceRequest(
+                            name="nvidia", count=-1, capabilities=[["gpu"]]
                         )
                     )
-                    else DeviceRequest(
-                        name="nvidia", count=-1, capabilities=[["gpu"]]
-                    )
-                )
 
-                run_parameters["device_requests"] = [gpu_device_request]
-                run_parameters["environment"]["NVIDIA_VISIBLE_DEVICES"] = "all"
+                    run_parameters["device_requests"] = [gpu_device_request]
+                    run_parameters["environment"]["NVIDIA_VISIBLE_DEVICES"] = "all"
 
-            container = docker_host_client.containers.create(**run_parameters)
-            if first_run and train_container.config_override:
-                # A clone has no container yet: its train_config is the one baked into
-                # the image, overridden by the values given at clone time.
-                preserved_files = {
-                    **preserved_files,
-                    **_clone_config_files(container.id, train_container),
-                }
-            write_train_container_files(container.id, preserved_files)
-            container.start()
-            train_container.container_id = container.id
+                container = docker_host_client.containers.create(**run_parameters)
+                if first_run and train_container.config_override:
+                    # A clone has no container yet: its train_config is the one baked into
+                    # the image, overridden by the values given at clone time.
+                    preserved_files = {
+                        **preserved_files,
+                        **_clone_config_files(container.id, train_container),
+                    }
+                write_train_container_files(container.id, preserved_files)
+                container.start()
+                train_container.container_id = container.id
 
-            train_container.score = None
-            sql_api.update_train_container(db, train_container)
+                train_container.score = None
+                sql_api.update_train_container(task_db, train_container)
 
-            if dataset.annotation_task_id is not None:
-                update_annotations_from_cvat(dataset, user.minio_token)
+                if dataset.annotation_task_id is not None:
+                    update_annotations_from_cvat(dataset, user.minio_token)
         except Exception as e:
-            on_error(str(e))
+            logger.exception("Run of train container #%s failed", train_container_id)
+            on_error(task_error_message(e))
 
     _, task_location_url, _ = task_creator.create_background_task(
         _run_train_container,
         task_title=f"Run Train Container #{train_container_id}.",
-        db=db,
         user=user,
         train_container_id=train_container_id,
     )
@@ -446,27 +449,29 @@ def update_train_container_score(
 @router.post("/containers/{train_container_id}/stop")
 def stop_train_container(
     train_container_id: int,
-    db: Session = Depends(get_db),
     task_creator: TaskCreator = Depends(get_task_creator),
 ) -> Response:
     def _stop_train_container(
         on_error,
         on_progress_change,
-        db: Session,
         train_container_id: int,
     ) -> None:
         try:
-            train_container: TrainContainer = check_exists(
-                sql_api.get_train_container(db, train_container_id)
-            )
-            get_container(train_container.container_id).stop()
+            # The task runs in another thread than the request. It therefore opens
+            # its own session: the request session is closed as soon as the
+            # response is sent.
+            with SessionLocal() as task_db:
+                train_container: TrainContainer = check_exists(
+                    sql_api.get_train_container(task_db, train_container_id)
+                )
+                get_container(train_container.container_id).stop()
         except Exception as e:
-            on_error(str(e))
+            logger.exception("Stop of train container #%s failed", train_container_id)
+            on_error(task_error_message(e))
 
     _, task_location_url, _ = task_creator.create_background_task(
         _stop_train_container,
         task_title=f"Stop Train Container #{train_container_id}.",
-        db=db,
         train_container_id=train_container_id,
     )
 
@@ -860,7 +865,6 @@ def get_architectures(provider: str) -> List[Dict]:
 @router.post("/config")
 async def process_train_config(
     request: Request,
-    db: Session = Depends(get_db),
     task_creator: TaskCreator = Depends(get_task_creator),
 ) -> Response:
     user: KeycloakUser = request.user
@@ -891,7 +895,6 @@ async def process_train_config(
     _, task_location_url, _ = task_creator.create_background_task(
         build_train_image,
         task_title=f"Train Container Buildjob: {architecture} ({provider})",
-        db=db,
         provider=provider,
         category=category,
         architecture=architecture,
