@@ -8,20 +8,42 @@ removes the container and reports the reason, and the containers of a device can
 The tests need no database: sessions, SQL access and Portainer are replaced by fakes.
 """
 
+import os
+from unittest import mock
+from unittest.mock import MagicMock
+
+os.environ.setdefault("MINIO_ENDPOINT", "minio:9000")
+
+import python_on_whales
+import docker
+import docker.tls
+
+python_on_whales.DockerClient = MagicMock()
+docker.APIClient = MagicMock()
+docker.tls.TLSConfig = MagicMock()
+docker.from_env = MagicMock()
+docker.DockerClient = MagicMock()
+import python_on_whales.docker_client
+
+python_on_whales.docker_client.DockerClient = MagicMock()
+
 import pytest
 import requests
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from sqlalchemy.orm.exc import DetachedInstanceError
 
-from agri_gaia_backend.db.models import ContainerDeploymentStatus
-from agri_gaia_backend.routers import container_deployments as cd
-from agri_gaia_backend.routers import edge_devices as ed
-from agri_gaia_backend.services.portainer import portainer_api
-from agri_gaia_backend.services.portainer.portainer_api import (
-    DeploymentStartError,
-    PortainerAPI,
-)
+# portainer_api logs into Portainer when it is imported; without Portainer the login
+# fails with an HTTPError, which the module tolerates.
+with mock.patch("requests.post", side_effect=requests.HTTPError("no Portainer in tests")):
+    from agri_gaia_backend.db.models import ContainerDeploymentStatus
+    from agri_gaia_backend.routers import container_deployments as cd
+    from agri_gaia_backend.routers import edge_devices as ed
+    from agri_gaia_backend.services.portainer import portainer_api
+    from agri_gaia_backend.services.portainer.portainer_api import (
+        DeploymentStartError,
+        PortainerAPI,
+    )
 
 
 class FakeSession:
