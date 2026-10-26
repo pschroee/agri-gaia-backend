@@ -71,6 +71,7 @@ from agri_gaia_backend.util.train import (
     uninstall_template,
     get_onnx_model_filepath,
     read_from_container,
+    read_class_order,
     read_train_container_files,
     write_train_container_files,
     get_config_with_schema,
@@ -656,6 +657,28 @@ async def get_train_container_model(
             filename="train.log",
             data=train_container_logs,
         )
+
+        if train_container.category == "Classification":
+            try:
+                labels = read_class_order(train_container.container_id)
+                shape = model.output_shape
+                if labels and (not shape or shape[-1] == len(labels)):
+                    model.output_labels = labels
+                    db.commit()
+                    db.refresh(model)
+                elif labels:
+                    logger.warning(
+                        "class order of train container %s not set: %d labels, output shape %s",
+                        train_container_id,
+                        len(labels),
+                        shape,
+                    )
+            except Exception as e:
+                logger.warning(
+                    "class order of train container %s not set: %s",
+                    train_container_id,
+                    e,
+                )
 
         return model
     except HTTPException as e:

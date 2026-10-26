@@ -8,6 +8,7 @@
 # SPDX-FileContributor: Maik Fruhner
 # SPDX-FileContributor: Prof. Dr.-Ing. Heiko Tapken
 # SPDX-FileContributor: Tobias Wamhof
+# SPDX-FileContributor: Philipp Schröer
 #
 # SPDX-License-Identifier: MIT
 
@@ -135,7 +136,9 @@ def get_label_names(annotation_file: Dict) -> List[str]:
         else:
             label_names += [label["name"] for label in labels]
     assert label_names, "No labels present in annotations file."
-    return list(set(label_names))
+    # Keep the order of the annotations file: the class index of every template is
+    # the position in this list, and a set has no stable order across processes.
+    return list(dict.fromkeys(label_names))
 
 
 def get_annotations(annotation_file: Dict) -> List[Dict]:
