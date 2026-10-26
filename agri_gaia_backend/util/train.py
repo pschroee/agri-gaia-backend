@@ -407,6 +407,33 @@ def read_from_container(container_id: str, container_filepath: str) -> bytes:
             return fh.read()
 
 
+def read_class_order(container_id: str) -> Optional[List[str]]:
+    """Class names of a finished training in the order of the network outputs.
+
+    Reads the categories the training template wrote to its label file; the
+    class index of an output is the position of its category sorted by id.
+    Returns None if the file is missing or unusable.
+    """
+    for split in ("val", "train"):
+        try:
+            data = read_from_container(
+                container_id, f"/datasets/labels/{split}/labels.json"
+            )
+        except Exception:
+            continue
+        if not data:
+            continue
+        try:
+            categories = sorted(json.loads(data)["categories"], key=lambda c: c["id"])
+            names = [str(c["name"]) for c in categories]
+        except Exception:
+            return None
+        if not names or len(set(names)) != len(names):
+            return None
+        return names
+    return None
+
+
 def merge_train_config(base: Dict, override: Dict) -> bytes:
     """train_config.json of a clone: the config baked into the image, overridden by the clone's values."""
     return json.dumps({**base, **override}, indent=4).encode("utf-8")
