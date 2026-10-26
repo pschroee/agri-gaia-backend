@@ -6,6 +6,7 @@
 # SPDX-FileContributor: Maik Fruhner
 # SPDX-FileContributor: Prof. Dr.-Ing. Heiko Tapken
 # SPDX-FileContributor: Tobias Wamhof
+# SPDX-FileContributor: Philipp Schröer
 #
 # SPDX-License-Identifier: MIT
 
@@ -14,7 +15,6 @@ import json
 import logging
 from random import randbytes
 import time
-import traceback
 import numpy as np
 from io import BytesIO
 from PIL import Image
@@ -23,11 +23,12 @@ from typing import List, Optional, Union, Tuple
 from agri_gaia_backend.db import model_api as sql_api
 from agri_gaia_backend.db import dataset_api as dataset_sql_api
 from agri_gaia_backend.db import tasks_api
+from agri_gaia_backend.db.database import SessionLocal
 from agri_gaia_backend.routers.common import (
     TaskCreator,
     check_exists,
-    get_db,
     get_task_creator,
+    task_error_message,
 )
 from agri_gaia_backend.schemas.keycloak_user import KeycloakUser
 from agri_gaia_backend.services import minio_api
@@ -74,7 +75,6 @@ def get_tritonInfo(
     models: List[int],
     datasets: List[int],
     url: Optional[str] = "triton:8000",
-    db: Session = Depends(get_db),
     task_creator: TaskCreator = Depends(get_task_creator),
 ) -> None:
     user: KeycloakUser = request.user
@@ -82,149 +82,151 @@ def get_tritonInfo(
     def _run_inference(
         on_error,
         on_progress_change,
-        db: Session,
         user: KeycloakUser,
         models,
         datasets,
         url,
     ) -> dict:
         try:
-            for model_id in models:
-                token = user.minio_token
-                model = check_exists(sql_api.get_model(db, model_id))
-                model_name = str(model_id)
+            # The task runs in another thread than the request. It therefore opens
+            # its own session: the request session is closed as soon as the
+            # response is sent.
+            with SessionLocal() as task_db:
+                for model_id in models:
+                    token = user.minio_token
+                    model = check_exists(sql_api.get_model(task_db, model_id))
+                    model_name = str(model_id)
 
-                # initialize Triton connection
-                # Triton Command:
-                # docker run --gpus=1 --rm -p6000:8000 -p6001:8001 -p6002:8002 -v/:/models nvcr.io/nvidia/tritonserver:23.09-py3 tritonserver --model-repository=s3://<platform_path>:9000/triton --model-control-mode=poll
-                try:
-                    triton_client = httpclient.InferenceServerClient(
-                        url=url, verbose=True
-                    )
-                except Exception as e:
-                    raise RuntimeError("Context creation failed: " + str(e))
+                    # initialize Triton connection
+                    # Triton Command:
+                    # docker run --gpus=1 --rm -p6000:8000 -p6001:8001 -p6002:8002 -v/:/models nvcr.io/nvidia/tritonserver:23.09-py3 tritonserver --model-repository=s3://<platform_path>:9000/triton --model-control-mode=poll
+                    try:
+                        triton_client = httpclient.InferenceServerClient(
+                            url=url, verbose=True
+                        )
+                    except Exception as e:
+                        raise RuntimeError("Context creation failed: " + str(e))
 
-                # download the model file
-                # get all filenames in the model directory
-                bucket_name = model.bucket_name
-                _validate_parameters(bucket_name, token)
-                model_prefix = f"models/{model.id}"
-                model_filepath = f"{model_prefix}/{model.file_name}"
-                model_objects = minio_api.get_all_objects(
-                    bucket_name, prefix=model_prefix, token=token
-                )
-
-                if not len(model_objects):
-                    raise HTTPException(
-                        status_code=404,
-                        detail=f"No model objects found in bucket '{model_prefix}'.",
+                    # download the model file
+                    # get all filenames in the model directory
+                    bucket_name = model.bucket_name
+                    _validate_parameters(bucket_name, token)
+                    model_prefix = f"models/{model.id}"
+                    model_filepath = f"{model_prefix}/{model.file_name}"
+                    model_objects = minio_api.get_all_objects(
+                        bucket_name, prefix=model_prefix, token=token
                     )
 
-                # get the actual model file and upload it to the triton bucket
-                _upload_model_files_to_triton(
-                    bucket_name, token, model_objects, model_filepath, model, model_name
-                )
+                    if not len(model_objects):
+                        raise HTTPException(
+                            status_code=404,
+                            detail=f"No model objects found in bucket '{model_prefix}'.",
+                        )
 
-                try:
-                    retries = 0
-                    while not triton_client.is_model_ready(model_name=model_name):
-                        time.sleep(0.5)
-                        retries += 1
-                        if retries > 300:
-                            raise RuntimeError(
-                                "Triton failed to load the model in time."
-                            )
-
-                    model_metadata = triton_client.get_model_metadata(
-                        model_name=model_name
-                    )
-                except InferenceServerException as e:
-                    raise RuntimeError("Failed to retrieve the metadata: " + str(e))
-
-                try:
-                    model_config = triton_client.get_model_config(model_name=model_name)
-                except InferenceServerException as e:
-                    raise RuntimeError("Failed to retrieve the config: " + str(e))
-
-                model_metadata, model_config = convert_http_metadata_config(
-                    model_metadata, model_config
-                )
-
-                # retrieve necessary values for preprocessing from config and metadata
-                (
-                    max_batch_size,
-                    input_name,
-                    output_name,
-                    c,
-                    h,
-                    w,
-                    format,
-                    dtype,
-                ) = parse_model(model_metadata, model_config, model)
-
-                # download the dataset files
-                for dataset_id in datasets:
-                    image_data, filenames = _load_image_data(
-                        token, dtype, c, h, w, db, dataset_id, format
+                    # get the actual model file and upload it to the triton bucket
+                    _upload_model_files_to_triton(
+                        bucket_name, token, model_objects, model_filepath, model, model_name
                     )
 
-                    # Send requests of FLAGS.batch_size images. If the number of
-                    # images isn't an exact multiple of FLAGS.batch_size then just
-                    # start over with the first images until the batch is filled.
-                    # currently not supporting streaming
-                    responses = []
-                    filenames.sort()
+                    try:
+                        retries = 0
+                        while not triton_client.is_model_ready(model_name=model_name):
+                            time.sleep(0.5)
+                            retries += 1
+                            if retries > 300:
+                                raise RuntimeError(
+                                    "Triton failed to load the model in time."
+                                )
 
-                    supports_batching = model_config.max_batch_size > 0
-                    batch_size = (
-                        1
-                        if model_config.max_batch_size == 0
-                        else model_config.max_batch_size
+                        model_metadata = triton_client.get_model_metadata(
+                            model_name=model_name
+                        )
+                    except InferenceServerException as e:
+                        raise RuntimeError("Failed to retrieve the metadata: " + str(e))
+
+                    try:
+                        model_config = triton_client.get_model_config(model_name=model_name)
+                    except InferenceServerException as e:
+                        raise RuntimeError("Failed to retrieve the config: " + str(e))
+
+                    model_metadata, model_config = convert_http_metadata_config(
+                        model_metadata, model_config
                     )
 
-                    # Holds the handles to the ongoing HTTP async requests.
-                    async_requests = _infer_requests_async(
-                        triton_client,
-                        model_config,
-                        requestGenerator,
-                        image_data,
+                    # retrieve necessary values for preprocessing from config and metadata
+                    (
+                        max_batch_size,
                         input_name,
                         output_name,
+                        c,
+                        h,
+                        w,
+                        format,
                         dtype,
-                        filenames,
-                        model,
-                        batch_size,
-                        supports_batching,
-                        model_name,
-                    )
+                    ) = parse_model(model_metadata, model_config, model)
 
-                    # Collect results from the ongoing async requests
-                    # for HTTP Async requests.
-                    for async_request in async_requests:
-                        responses.append(async_request.get_result())
+                    # download the dataset files
+                    for dataset_id in datasets:
+                        image_data, filenames = _load_image_data(
+                            token, dtype, c, h, w, task_db, dataset_id, format
+                        )
 
-                    bucket = user.minio_bucket_name
+                        # Send requests of FLAGS.batch_size images. If the number of
+                        # images isn't an exact multiple of FLAGS.batch_size then just
+                        # start over with the first images until the batch is filled.
+                        # currently not supporting streaming
+                        responses = []
+                        filenames.sort()
 
-                    _collect_results_from_async_requests(
-                        responses,
-                        on_progress_change,
-                        output_name,
-                        batch_size,
-                        supports_batching,
-                        db,
-                        bucket,
-                        token,
-                        model_id,
-                        dataset_id,
-                    )
+                        supports_batching = model_config.max_batch_size > 0
+                        batch_size = (
+                            1
+                            if model_config.max_batch_size == 0
+                            else model_config.max_batch_size
+                        )
+
+                        # Holds the handles to the ongoing HTTP async requests.
+                        async_requests = _infer_requests_async(
+                            triton_client,
+                            model_config,
+                            requestGenerator,
+                            image_data,
+                            input_name,
+                            output_name,
+                            dtype,
+                            filenames,
+                            model,
+                            batch_size,
+                            supports_batching,
+                            model_name,
+                        )
+
+                        # Collect results from the ongoing async requests
+                        # for HTTP Async requests.
+                        for async_request in async_requests:
+                            responses.append(async_request.get_result())
+
+                        bucket = user.minio_bucket_name
+
+                        _collect_results_from_async_requests(
+                            responses,
+                            on_progress_change,
+                            output_name,
+                            batch_size,
+                            supports_batching,
+                            task_db,
+                            bucket,
+                            token,
+                            model_id,
+                            dataset_id,
+                        )
         except Exception as e:
-            traceback.print_exception(type(e), e, e.__traceback__)
-            on_error(str(e))
+            logger.exception("Inference run failed")
+            on_error(task_error_message(e))
 
     _, task_location_url, _ = task_creator.create_background_task(
         func=_run_inference,
         task_title=f"Inference for Model(s) {models} and Dataset(s) {datasets}.",
-        db=db,
         user=user,
         models=models,
         datasets=datasets,

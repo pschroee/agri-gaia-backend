@@ -39,6 +39,18 @@ def get_db() -> SessionLocal:
         db.close()
 
 
+def task_error_message(e: BaseException) -> str:
+    """Builds the message shown in a failed task from an exception."""
+    if isinstance(e, HTTPException):
+        message = str(e.detail)
+    else:
+        text = str(e)
+        message = f"{type(e).__name__}: {text}" if text else type(e).__name__
+    if len(message) > 1000:
+        message = message[:999] + "…"
+    return message
+
+
 class TaskCreator:
     """
     TaskCreator class. This class is responsible for creating tasks and running them in a background thread.
@@ -97,8 +109,9 @@ class TaskCreator:
                     logger.warn("Invalid value range of completion percentage")
 
             def on_error(message: str) -> None:
-                nonlocal error_message
+                nonlocal error_message, error_reported
                 error_message = message
+                error_reported = True
                 nonlocal task_execution_failed
                 task_execution_failed = True
 
@@ -107,6 +120,7 @@ class TaskCreator:
                 tasks_api.update_task(db, task)
 
             error_message = "Task failed. See backend logs for details."
+            error_reported = False
             task_execution_failed = False
             try:
                 task.status = TaskStatus.inprogress
@@ -132,6 +146,8 @@ class TaskCreator:
                 except Exception as e:
                     logger.exception(e)
                     task_execution_failed = True
+                    if not error_reported:
+                        error_message = task_error_message(e)
                     raise e
             finally:
                 if task_execution_failed:
