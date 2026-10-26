@@ -6,6 +6,7 @@
 # SPDX-FileContributor: Maik Fruhner
 # SPDX-FileContributor: Prof. Dr.-Ing. Heiko Tapken
 # SPDX-FileContributor: Tobias Wamhof
+# SPDX-FileContributor: Philipp Schröer
 #
 # SPDX-License-Identifier: MIT
 
@@ -40,3 +41,9 @@ class EdgeDevice(EdgeDeviceBase):
 
     class Config:
         orm_mode = True
+
+
+class EdgeContainer(BaseModel):
+    name: str
+    state: str
+    host_ports: List[int] = []
