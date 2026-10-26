@@ -103,6 +103,19 @@ def _error_message_from_response(response: requests.Response) -> str:
     )
 
 
+class DeploymentStartError(Exception):
+    """The container was created on the device, but its start failed.
+
+    ``container_id`` is only set if the container could not be removed again and
+    therefore stays on the device.
+    """
+
+    def __init__(self, message: str, container_id: str = None):
+        super().__init__(message)
+        self.message = message
+        self.container_id = container_id
+
+
 class PortainerAPI:
     def __init__(self) -> None:
         self.jwt = None
@@ -503,50 +516,110 @@ class PortainerAPI:
         create_container_response = response.json()
         container_id = create_container_response["Id"]
 
-        # get resource control ID of container just created
-        rc_id = create_container_response["Portainer"]["ResourceControl"]["Id"]
+        try:
+            # get resource control ID of container just created
+            rc_id = create_container_response["Portainer"]["ResourceControl"]["Id"]
 
-        # extract already-set user and team IDs
-        user_ids = [
-            user.get("UserId")
-            for user in create_container_response["Portainer"]["ResourceControl"]["UserAccesses"]
-        ]
-        team_ids = [
-            team.get("TeamId")
-            for team in create_container_response["Portainer"]["ResourceControl"]["TeamAccesses"]
-        ]
-        # append team ID of platform_users
-        team_ids.append(self.team_id)
+            # extract already-set user and team IDs
+            user_ids = [
+                user.get("UserId")
+                for user in create_container_response["Portainer"]["ResourceControl"]["UserAccesses"]
+            ]
+            team_ids = [
+                team.get("TeamId")
+                for team in create_container_response["Portainer"]["ResourceControl"]["TeamAccesses"]
+            ]
+            # append team ID of platform_users
+            team_ids.append(self.team_id)
 
-        # update resource control to allow access from platform_users
-        rc_response = requests.put(
-            url=f"{PORTAINER_API_URL}/resource_controls/{rc_id}",
-            verify=VERIFY_SSL,
-            headers=auth_header,
-            json={
-                "administratorsOnly": False,
-                "public": False,
-                "teams": team_ids,
-                "users": user_ids
-            },
-        )
-        if not rc_response.ok:
-            msg = rc_response.json().get("message", "Error setting resource control")
-            logger.error(rc_response)
-            raise HTTPException(400, msg)
+            # update resource control to allow access from platform_users
+            rc_response = requests.put(
+                url=f"{PORTAINER_API_URL}/resource_controls/{rc_id}",
+                verify=VERIFY_SSL,
+                headers=auth_header,
+                json={
+                    "administratorsOnly": False,
+                    "public": False,
+                    "teams": team_ids,
+                    "users": user_ids
+                },
+            )
+            if not rc_response.ok:
+                logger.error(rc_response)
+                raise HTTPException(
+                    400, _error_message_from_response(rc_response)
+                )
         
-        # start
-        response = requests.post(
-            url=f"{PORTAINER_API_URL}/endpoints/{edge_device.portainer_id}/docker/containers/{container_id}/start",
-            verify=VERIFY_SSL,
-            headers=auth_header,
-        )
-        if not response.ok:
-            msg = response.json()["message"]
-            logger.debug(msg)
-            raise HTTPException(400, msg)
+            # start
+            response = requests.post(
+                url=f"{PORTAINER_API_URL}/endpoints/{edge_device.portainer_id}/docker/containers/{container_id}/start",
+                verify=VERIFY_SSL,
+                headers=auth_header,
+            )
+            if not response.ok:
+                msg = _error_message_from_response(response)
+                logger.debug(msg)
+                raise HTTPException(400, msg)
+        except Exception as e:
+            message = e.detail if isinstance(e, HTTPException) else str(e)
+            message = str(message)
+            logger.error("Start of container %s failed: %s", container_id, message)
+            # a failed start must not leave the container (and its name) on the device
+            try:
+                self._remove_container(edge_device.portainer_id, container_id)
+            except Exception as cleanup_error:
+                raise DeploymentStartError(
+                    f"{message}; the container {container_id[:12]} could not be "
+                    f"removed ({cleanup_error}) and stays on the device",
+                    container_id=container_id,
+                ) from e
+            raise DeploymentStartError(
+                f"{message}; the container was removed from the device again"
+            ) from e
 
         return container_id
+
+    def _remove_container(self, endpoint_id: int, container_id: str) -> None:
+        """Removes a container (force, with its anonymous volumes). A missing container counts as removed."""
+        self._login_if_needed()
+        response = requests.delete(
+            url=f"{PORTAINER_API_URL}/endpoints/{endpoint_id}/docker/containers/{container_id}",
+            verify=VERIFY_SSL,
+            headers=self._get_auth_header(),
+            params={"v": 1, "force": True},
+            timeout=30,
+        )
+        if not (response.ok or response.status_code == 404):
+            raise HTTPError(_error_message_from_response(response))
+
+    def list_containers(self, endpoint_id: int) -> List[dict]:
+        """Lists all containers of an endpoint as name, state and published host ports."""
+        self._login_if_needed()
+        response = requests.get(
+            url=f"{PORTAINER_API_URL}/endpoints/{endpoint_id}/docker/containers/json",
+            verify=VERIFY_SSL,
+            headers=self._get_auth_header(),
+            params={"all": 1},
+            timeout=15,
+        )
+        if not response.ok:
+            raise HTTPError(_error_message_from_response(response))
+
+        containers = []
+        for c in response.json():
+            names = c.get("Names") or []
+            name = names[0].lstrip("/") if names else ""
+            ports = sorted(
+                {
+                    p["PublicPort"]
+                    for p in (c.get("Ports") or [])
+                    if p.get("PublicPort")
+                }
+            )
+            containers.append(
+                {"name": name, "state": c.get("State") or "", "host_ports": ports}
+            )
+        return containers
 
     def undeploy_container_from_edge_device(
         self, edge_device: EdgeDevice, container_deployment: ContainerDeployment
