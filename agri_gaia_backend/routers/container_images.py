@@ -6,6 +6,7 @@
 # SPDX-FileContributor: Maik Fruhner
 # SPDX-FileContributor: Prof. Dr.-Ing. Heiko Tapken
 # SPDX-FileContributor: Tobias Wamhof
+# SPDX-FileContributor: Philipp Schröer
 #
 # SPDX-License-Identifier: MIT
 
@@ -36,6 +37,7 @@ from agri_gaia_backend.db import (
     container_deployment_api as container_deployment_sql_api,
 )
 from agri_gaia_backend.db import models
+from agri_gaia_backend.db.database import SessionLocal
 from agri_gaia_backend.services.docker import image_builder
 from agri_gaia_backend.services.docker import docker_api
 from agri_gaia_backend.routers.common import (
@@ -199,25 +201,51 @@ def build_container(
     image_builder.validate_generator_input(model, edge_info)
 
     def build_and_push_image(
-        on_error, on_progress_change, model, edge_info, container_template
+        on_error,
+        on_progress_change,
+        model_id,
+        edge_device_id,
+        architecture,
+        container_template_id,
     ):
-        image_id = image_builder.build_and_push_image(
-            inference_container_template=container_template,
-            repository_name=config.repository,
-            image_tag=config.tag,
-            model=model,
-            edge_info=edge_info,
-            status_callback=lambda type, info: logger.debug(
-                f"{type}: {json.dumps(info)}"
-            ),
-        )
+        # The task runs in another thread than the request. It therefore opens
+        # its own session: the request session is closed as soon as the
+        # response is sent.
+        with SessionLocal() as task_db:
+            task_model = check_exists(
+                model_sql_api.get_model(task_db, model_id),
+                detail=f"Model with id '{model_id}' does not exist",
+            )
+            if edge_device_id is not None:
+                task_edge_info = check_exists(
+                    edge_sql_api.get_edge_device(task_db, edge_device_id),
+                    detail=f"Edge Device with id '{edge_device_id}' does not exist",
+                )
+            else:
+                task_edge_info = {"device_type": "generic", "architecture": architecture}
+            task_template = check_exists(
+                container_template_sql_api.get_container_template(
+                    task_db, container_template_id
+                )
+            )
+            image_builder.build_and_push_image(
+                inference_container_template=task_template,
+                repository_name=config.repository,
+                image_tag=config.tag,
+                model=task_model,
+                edge_info=task_edge_info,
+                status_callback=lambda type, info: logger.debug(
+                    f"{type}: {json.dumps(info)}"
+                ),
+            )
 
     _, task_location_url, _ = task_creator.create_background_task(
         build_and_push_image,
         task_title=f"Container Buildjob '{config.repository}/{config.tag}'",
-        model=model,
-        edge_info=edge_info,
-        container_template=container_template,
+        model_id=config.model_id,
+        edge_device_id=config.edge_device_id,
+        architecture=config.architecture,
+        container_template_id=config.container_template_id,
     )
 
     headers = {"Location": task_location_url}
