@@ -31,9 +31,9 @@ RUN pip install onnx==1.21.0 tf2onnx==1.17.0 onnxmltools==1.16.0 onnxconverter-c
 
 WORKDIR /usr/src/app
 
-COPY config_to_args.py config.py dataset.py cvat_dataset.py ./
-
-COPY requirements.txt setup.py util.py train.py export.py train_config.json custom.json presets.json export_config.json ./
+# Only requirements.txt before the heavy pip layers: code and the per-build
+# configuration follow the last RUN so that they never invalidate those layers.
+COPY requirements.txt ./
 
 # Re-point the base image's torch at the host-matched CUDA wheel, keeping the
 # exact version Ultralytics ships. Index is auto-selected from host GPUs by the
@@ -52,6 +52,11 @@ RUN CU="$(basename "${TORCH_CUDA_INDEX}")" && \
     pip3 install --index-url "${TORCH_CUDA_INDEX}" \
       "torch==${TORCH_VER}+${CU}" "torchvision==${TV_VER}+${CU}"
 RUN pip3 install -r requirements.txt
+
+COPY config_to_args.py config.py dataset.py cvat_dataset.py setup.py util.py train.py \
+  export.py ./
+
+COPY train_config.json custom.json presets.json export_config.json ./
 
 COPY .env ./
 
