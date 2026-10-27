@@ -260,3 +260,32 @@ def test_model_name_without_score_has_no_none():
     name = train_router.model_name_for_training(_tc(None), SimpleNamespace(name="mnist"))
     assert name == "EfficientNet (Torchvision) [mnist]" and "None" not in name
 
+
+
+# ---- explicit device files (#247, GPU kept across a systemd reload) ----
+
+
+def test_gpu_device_files_default_only_existing(monkeypatch):
+    monkeypatch.delenv("GPU_DEVICE_FILES", raising=False)
+    present = {"/dev/nvidia0", "/dev/nvidiactl", "/dev/nvidia-uvm"}
+    monkeypatch.setattr(train_router.os.path, "exists", lambda p: p in present)
+    assert train_router.gpu_device_files() == [
+        "/dev/nvidia0:/dev/nvidia0:rwm",
+        "/dev/nvidiactl:/dev/nvidiactl:rwm",
+        "/dev/nvidia-uvm:/dev/nvidia-uvm:rwm",
+    ]
+
+
+def test_gpu_device_files_from_env(monkeypatch):
+    monkeypatch.setenv("GPU_DEVICE_FILES", "/dev/nvidia1, /dev/nvidiactl")
+    monkeypatch.setattr(train_router.os.path, "exists", lambda p: True)
+    assert train_router.gpu_device_files() == [
+        "/dev/nvidia1:/dev/nvidia1:rwm",
+        "/dev/nvidiactl:/dev/nvidiactl:rwm",
+    ]
+
+
+def test_gpu_device_files_none_without_files(monkeypatch):
+    monkeypatch.delenv("GPU_DEVICE_FILES", raising=False)
+    monkeypatch.setattr(train_router.os.path, "exists", lambda p: False)
+    assert train_router.gpu_device_files() == []

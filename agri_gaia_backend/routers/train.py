@@ -120,6 +120,26 @@ GPU_NOT_VISIBLE_MESSAGE = (
 )
 
 
+# The NVIDIA device files a GPU container gets explicitly besides its device request (#247): after a
+# `systemctl daemon-reload` a container with only `--gpus` loses the GPU (NVML "Unknown Error", systemd cgroup
+# driver); with the files given as devices it keeps it (shown on the instance, 27.10.2026). GPU_DEVICE_FILES
+# overrides the list (comma separated); only files that exist are passed.
+DEFAULT_GPU_DEVICE_FILES = (
+    "/dev/nvidia0",
+    "/dev/nvidiactl",
+    "/dev/nvidia-uvm",
+    "/dev/nvidia-uvm-tools",
+    "/dev/nvidia-modeset",
+)
+
+
+def gpu_device_files() -> List[str]:
+    """The device mappings ("path:path:rwm") of the NVIDIA device files that exist."""
+    raw = os.getenv("GPU_DEVICE_FILES", "")
+    paths = [p.strip() for p in raw.split(",") if p.strip()] if raw else list(DEFAULT_GPU_DEVICE_FILES)
+    return [f"{p}:{p}:rwm" for p in paths if os.path.exists(p)]
+
+
 def gpu_device_request_for_run(on_message=None) -> Optional[DeviceRequest]:
     """Return the GPU request for a training container, or None for the CPU.
 
@@ -440,6 +460,9 @@ async def run_train_container(
                 if gpu_device_request is not None:
                     run_parameters["device_requests"] = [gpu_device_request]
                     run_parameters["environment"]["NVIDIA_VISIBLE_DEVICES"] = "all"
+                    device_files = gpu_device_files()
+                    if device_files:
+                        run_parameters["devices"] = device_files
 
                 container = docker_host_client.containers.create(**run_parameters)
                 if first_run and train_container.config_override:
