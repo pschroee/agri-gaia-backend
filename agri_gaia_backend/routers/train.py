@@ -295,6 +295,7 @@ def build_train_image(
                         f"{type}: {json.dumps(info)}"
                     ),
                     on_phase=on_phase,
+                    remove_after_push=True,
                     **build_kwargs,
                 )
 
