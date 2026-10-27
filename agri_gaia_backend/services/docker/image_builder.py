@@ -229,6 +229,7 @@ def _build_and_push_image(
     image_tag: str,
     status_callback: Callable[[str, dict], None],
     on_phase: Optional[Callable[[str, float], None]] = None,
+    remove_after_push: bool = False,
     **kwargs,
 ):
     """Builds an image from the given dockerfile.
@@ -240,6 +241,9 @@ def _build_and_push_image(
         status_callback     : a callback function for statusupdates during the build
         on_phase            : optional, called with (phase text, fraction between 0 and 1)
             while the image is built and pushed, at most every 2 seconds
+        remove_after_push   : remove the pushed image (tag) from the build container after a
+            successful push. The BuildKit cache is kept, so later builds still hit it. A failure
+            to remove is only logged.
         buildargs           : additional arguments that can be used in build phase
         network             : the network the build container shall connect to. Set this to 'host'
             if the build container needs to connect to the platform services in RUN statements.
@@ -264,6 +268,15 @@ def _build_and_push_image(
                 progress.feed(log)
         if progress:
             progress.finish()
+
+        if remove_after_push:
+            try:
+                docker.image.remove(repository_url_with_tag)
+            except Exception as e:
+                logger.warning(
+                    f"Could not remove image '{repository_url_with_tag}' "
+                    f"from the build container: {e}"
+                )
 
     except python_on_whales.exceptions.DockerException as e:
         status_callback("failed", {"reason": str(e)})
