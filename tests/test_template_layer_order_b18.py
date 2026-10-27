@@ -95,7 +95,7 @@ def test_config_files_after_last_run_and_last_before_env(path):
     # and CMD may follow it.
     tail = instructions[max(config_indexes) + 1 :]
     assert all(k in ("COPY", "ENTRYPOINT", "CMD") for k, _ in tail)
-    assert [a for k, a in tail if k == "COPY"] == [". ./".replace(". ", ".env ")]
+    assert [a for k, a in tail if k == "COPY"] == [".env ./"]
 
 
 @pytest.mark.parametrize("path", DOCKERFILES, ids=_name)
