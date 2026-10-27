@@ -155,16 +155,38 @@ def gpu_device_request_for_run(on_message=None) -> Optional[DeviceRequest]:
     return DeviceRequest(name="nvidia", count=-1, capabilities=[["gpu"]])
 
 
-def score_from_logs(score_regexp, logs: str):
-    """The last score in the tail of a training log: the template's regexp, else the Lightning fallback; None if none."""
-    tail = "\n".join(logs.splitlines()[-50:]) + "\n"
-    matches = re.findall(re.compile(score_regexp), tail) if score_regexp else []
-    if not matches:
-        matches = re.findall(FALLBACK_SCORE_REGEXP, tail)
-    if matches and type(matches[0]) is not str:
-        matches = list(chain.from_iterable(matches))
-    values = [m.strip() for m in matches if is_float(m.strip())]
-    return round(float(values[-1]), 3) if values else None
+def read_score_from_logs(train_container) -> Optional[float]:
+    """Score of a finished training read from its container logs.
+
+    Tries the regexp of the template first, then the Lightning fallback.
+    Returns None if the logs hold no score; raises if a match is not a number.
+    """
+    logs = get_container(train_container.container_id).logs(tail=50).decode("utf-8")
+
+    score_regexp = re.compile(train_container.score_regexp)
+    score_matches = re.findall(score_regexp, logs)
+    if not score_matches:
+        # Lightning prints its test table as "MulticlassAccuracy  0.98"; the
+        # regexp of the template does not always match it.
+        score_matches = re.findall(FALLBACK_SCORE_REGEXP, logs)
+
+    if not score_matches:
+        return None
+
+    if type(score_matches[0]) is not str:
+        score_matches = chain.from_iterable(score_matches)
+
+    return round(
+        float(
+            list(
+                filter(
+                    lambda s: is_float(s),
+                    map(lambda s: s.strip(), score_matches),
+                )
+            )[-1]
+        ),
+        3,
+    )
 
 
 def model_name_for_training(train_container, dataset) -> str:
@@ -466,40 +488,18 @@ def update_train_container_score(
     if train_container.score is not None:
         return train_container
 
-    logs = get_container(train_container.container_id).logs(tail=50).decode("utf-8")
-
-    score_regexp = re.compile(train_container.score_regexp)
-    score_matches = re.findall(score_regexp, logs)
-    if not score_matches:
-        # Lightning prints its test table as "MulticlassAccuracy  0.98"; the
-        # regexp of the template does not always match it.
-        score_matches = re.findall(FALLBACK_SCORE_REGEXP, logs)
-
-    if not score_matches:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No score for Train Container #{train_container_id} found in logs.",
-        )
-
     try:
-        if type(score_matches[0]) is not str:
-            score_matches = chain.from_iterable(score_matches)
-
-        score = round(
-            float(
-                list(
-                    filter(
-                        lambda s: is_float(s),
-                        map(lambda s: s.strip(), score_matches),
-                    )
-                )[-1]
-            ),
-            3,
-        )
+        score = read_score_from_logs(train_container)
     except Exception as e:
         raise HTTPException(
             status_code=500,
             detail=f"Unable to extract score for Train Container #{train_container_id}: {str(e)}",
+        )
+
+    if score is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No score for Train Container #{train_container_id} found in logs.",
         )
 
     train_container.score = score
@@ -680,6 +680,23 @@ async def get_train_container_model(
             dataset_sql_api.get_dataset(db, train_container.dataset_id),
         )
 
+        if train_container.score is None:
+            # Taking over a model is the moment its name is made, so read the
+            # score now if nobody has asked for it yet. A failure leaves the
+            # name without a value.
+            try:
+                if get_container_status(train_container.container_id) == "exited":
+                    score = read_score_from_logs(train_container)
+                    if score is not None:
+                        train_container.score = score
+                        sql_api.update_train_container(db, train_container)
+            except Exception as e:
+                logger.warning(
+                    "score of train container %s not read: %s",
+                    train_container_id,
+                    e,
+                )
+
         generic_model_filepath = train_container.model_filepath
         onnx_model_filepath = get_onnx_model_filepath(generic_model_filepath)
 
@@ -707,21 +724,6 @@ async def get_train_container_model(
 
         trained_model_filename = os.path.basename(trained_model_filepath)
         train_container_logs = get_container(train_container.container_id).logs()
-
-        # Nobody may have asked for the score yet (PATCH .../score; the agent never does): read it from the log
-        # here, so that the model's name carries it (#247).
-        if train_container.score is None:
-            try:
-                score = score_from_logs(
-                    train_container.score_regexp,
-                    train_container_logs.decode("utf-8", errors="replace"),
-                )
-            except Exception as e:  # the name falls back to the dataset alone
-                logger.warning(f"Score of Train Container #{train_container_id} not read: {e}")
-                score = None
-            if score is not None:
-                train_container.score = score
-                sql_api.update_train_container(db, train_container)
 
         model: Model = persist_model(
             db=db,
