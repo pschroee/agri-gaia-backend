@@ -319,7 +319,8 @@ def test_build_train_image_uses_own_session(monkeypatch, tmp_path):
     errors, messages = _run(train_router.build_train_image, kwargs)
     assert errors == []
     assert dbs and all(isinstance(db, _TaskDb) for db in dbs)
-    assert messages == ["Train Container #7 created."]
+    # #247: the build now reports its phases before the final message
+    assert messages == ["Creating the training container", "Train Container #7 created."]
     assert _TaskDb.instances[-1].closed
 
 
