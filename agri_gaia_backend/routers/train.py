@@ -110,6 +110,59 @@ def train_container_created_message(train_container_id: int) -> str:
     return f"Train Container #{train_container_id} created."
 
 
+FALLBACK_SCORE_REGEXP = re.compile(
+    r"(?:Multiclass|Binary)?Accuracy\W+([0-9]*\.?[0-9]+)"
+)
+
+GPU_NOT_VISIBLE_MESSAGE = (
+    "GPU configured, but the backend cannot see it (NVML); "
+    "the training container still requests it."
+)
+
+
+def gpu_device_request_for_run(on_message=None) -> Optional[DeviceRequest]:
+    """Return the GPU request for a training container, or None for the CPU.
+
+    If GPUS is set, the GPU is always requested: the container is created at the
+    host daemon, which hands out the GPU afresh, so the backend does not need to
+    see it itself. After a systemd reload the backend loses its own NVML view
+    (the /dev/char links vanish) while the host GPU is fine; asking nvidia-smi in
+    the backend then used to put the training silently on the CPU. If the host
+    really has no GPU, creating the container fails loudly. Without GPUS the
+    backend's own view decides, as before.
+    """
+    gpu_device_ids = os.getenv("GPUS")
+    if gpu_device_ids:
+        if not gpu_available():
+            logger.error(
+                "GPUS is set, but the backend cannot see the GPU (NVML); "
+                "the training container still requests it."
+            )
+            if on_message:
+                on_message(GPU_NOT_VISIBLE_MESSAGE)
+    elif not gpu_available():
+        return None
+
+    # See: https://github.com/docker/docker-py/blob/82cf559b5a641f53e9035b44b91f829f3b4cca80/docker/types/containers.py
+    if (
+        gpu_device_ids
+        and gpu_device_ids != "all"
+        and all(map(lambda x: x.isdigit(), gpu_device_ids.split(",")))
+    ):
+        return DeviceRequest(
+            name="nvidia", device_ids=[gpu_device_ids], capabilities=[["gpu"]]
+        )
+    return DeviceRequest(name="nvidia", count=-1, capabilities=[["gpu"]])
+
+
+def model_name_for_training(train_container, dataset) -> str:
+    """Name of the model made from a training; the score is left out if unknown."""
+    detail = dataset.name
+    if train_container.score is not None:
+        detail += f", {train_container.score} {train_container.score_name}"
+    return f"{train_container.architecture} ({train_container.provider}) [{detail}]"
+
+
 def build_train_image(
     on_error,
     on_progress_change,
@@ -174,6 +227,11 @@ def build_train_image(
                     else {}
                 )
 
+                def on_phase(text: str, fraction: float) -> None:
+                    if on_message:
+                        on_message(text)
+                    on_progress_change(fraction)
+
                 image_builder._build_and_push_image(
                     context_directory=context_directory,
                     repository_url=repository_url,
@@ -182,8 +240,13 @@ def build_train_image(
                     status_callback=lambda type, info: logger.info(
                         f"{type}: {json.dumps(info)}"
                     ),
+                    on_phase=on_phase,
                     **build_kwargs,
                 )
+
+            if on_message:
+                on_message(image_builder.PHASE_CREATING_CONTAINER)
+            on_progress_change(0.95)
 
             image_id = f"{repository_url}:{image_tag}"
 
@@ -267,6 +330,7 @@ async def run_train_container(
         on_progress_change,
         user: KeycloakUser,
         train_container_id: int,
+        on_message=None,
     ) -> None:
         try:
             # The task runs in another thread than the request. It therefore opens
@@ -338,27 +402,8 @@ async def run_train_container(
                     ],
                 }
 
-                if gpu_available():
-                    # See: https://github.com/docker/docker-py/blob/82cf559b5a641f53e9035b44b91f829f3b4cca80/docker/types/containers.py
-                    gpu_device_ids = os.getenv("GPUS")
-                    gpu_device_request = (
-                        DeviceRequest(
-                            name="nvidia",
-                            device_ids=[gpu_device_ids],
-                            capabilities=[["gpu"]],
-                        )
-                        if (
-                            gpu_device_ids
-                            and gpu_device_ids != "all"
-                            and all(
-                                map(lambda x: x.isdigit(), gpu_device_ids.split(","))
-                            )
-                        )
-                        else DeviceRequest(
-                            name="nvidia", count=-1, capabilities=[["gpu"]]
-                        )
-                    )
-
+                gpu_device_request = gpu_device_request_for_run(on_message)
+                if gpu_device_request is not None:
                     run_parameters["device_requests"] = [gpu_device_request]
                     run_parameters["environment"]["NVIDIA_VISIBLE_DEVICES"] = "all"
 
@@ -413,6 +458,10 @@ def update_train_container_score(
 
     score_regexp = re.compile(train_container.score_regexp)
     score_matches = re.findall(score_regexp, logs)
+    if not score_matches:
+        # Lightning prints its test table as "MulticlassAccuracy  0.98"; the
+        # regexp of the template does not always match it.
+        score_matches = re.findall(FALLBACK_SCORE_REGEXP, logs)
 
     if not score_matches:
         raise HTTPException(
@@ -650,7 +699,7 @@ async def get_train_container_model(
         model: Model = persist_model(
             db=db,
             user=user,
-            name=f"{train_container.architecture} ({train_container.provider}) [{dataset.name}, {train_container.score} {train_container.score_name}]",
+            name=model_name_for_training(train_container, dataset),
             filename=trained_model_filename,
             model_file=io.BytesIO(trained_model_data),
             format=infer_model_format(trained_model_filename),

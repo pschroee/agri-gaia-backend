@@ -207,7 +207,13 @@ def build_container(
         edge_device_id,
         architecture,
         container_template_id,
+        on_message=None,
     ):
+        def on_phase(text: str, fraction: float) -> None:
+            if on_message:
+                on_message(text)
+            on_progress_change(fraction)
+
         # The task runs in another thread than the request. It therefore opens
         # its own session: the request session is closed as soon as the
         # response is sent.
@@ -237,6 +243,7 @@ def build_container(
                 status_callback=lambda type, info: logger.debug(
                     f"{type}: {json.dumps(info)}"
                 ),
+                on_phase=on_phase,
             )
 
     _, task_location_url, _ = task_creator.create_background_task(
