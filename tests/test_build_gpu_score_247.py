@@ -259,3 +259,20 @@ def test_model_name_with_score():
 def test_model_name_without_score_has_no_none():
     name = train_router.model_name_for_training(_tc(None), SimpleNamespace(name="mnist"))
     assert name == "EfficientNet (Torchvision) [mnist]" and "None" not in name
+
+
+# ---- score read when the model is made (live finding of Phase B, 27.10.2026) ----
+
+
+def test_score_from_logs_reads_the_lightning_table():
+    assert train_router.score_from_logs(r"[ ]+Accuracy[ ]+(\d*[.]\d*)\n", LIGHTNING_TABLE) == 0.987
+
+
+def test_score_from_logs_prefers_the_template_regexp():
+    logs = "val_acc=0.5\n" + LIGHTNING_TABLE
+    assert train_router.score_from_logs(r"val_acc=([0-9.]+)", logs) == 0.5
+
+
+def test_score_from_logs_none_without_a_match():
+    assert train_router.score_from_logs(r"val_acc=([0-9.]+)", "no score here\n") is None
+    assert train_router.score_from_logs(None, "no score here\n") is None

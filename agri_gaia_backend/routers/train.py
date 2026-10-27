@@ -155,6 +155,18 @@ def gpu_device_request_for_run(on_message=None) -> Optional[DeviceRequest]:
     return DeviceRequest(name="nvidia", count=-1, capabilities=[["gpu"]])
 
 
+def score_from_logs(score_regexp, logs: str):
+    """The last score in the tail of a training log: the template's regexp, else the Lightning fallback; None if none."""
+    tail = "\n".join(logs.splitlines()[-50:]) + "\n"
+    matches = re.findall(re.compile(score_regexp), tail) if score_regexp else []
+    if not matches:
+        matches = re.findall(FALLBACK_SCORE_REGEXP, tail)
+    if matches and type(matches[0]) is not str:
+        matches = list(chain.from_iterable(matches))
+    values = [m.strip() for m in matches if is_float(m.strip())]
+    return round(float(values[-1]), 3) if values else None
+
+
 def model_name_for_training(train_container, dataset) -> str:
     """Name of the model made from a training; the score is left out if unknown."""
     detail = dataset.name
@@ -695,6 +707,21 @@ async def get_train_container_model(
 
         trained_model_filename = os.path.basename(trained_model_filepath)
         train_container_logs = get_container(train_container.container_id).logs()
+
+        # Nobody may have asked for the score yet (PATCH .../score; the agent never does): read it from the log
+        # here, so that the model's name carries it (#247).
+        if train_container.score is None:
+            try:
+                score = score_from_logs(
+                    train_container.score_regexp,
+                    train_container_logs.decode("utf-8", errors="replace"),
+                )
+            except Exception as e:  # the name falls back to the dataset alone
+                logger.warning(f"Score of Train Container #{train_container_id} not read: {e}")
+                score = None
+            if score is not None:
+                train_container.score = score
+                sql_api.update_train_container(db, train_container)
 
         model: Model = persist_model(
             db=db,
