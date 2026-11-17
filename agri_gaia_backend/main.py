@@ -6,12 +6,14 @@
 # SPDX-FileContributor: Maik Fruhner
 # SPDX-FileContributor: Prof. Dr.-Ing. Heiko Tapken
 # SPDX-FileContributor: Tobias Wamhof
+# SPDX-FileContributor: Philipp Schröer
 #
 # SPDX-License-Identifier: MIT
 
 # load environment variables
 import logging
 from agri_gaia_backend import db
+from agri_gaia_backend.db import tasks_api
 from agri_gaia_backend.util.common import get_stacktrace
 from agri_gaia_backend.util.env import bool_from_env
 from agri_gaia_backend.services.portainer.portainer_api import portainer
@@ -89,6 +91,13 @@ else:
 
 debug = bool_from_env("DEBUG")
 app = FastAPI(debug=debug)
+
+
+@app.on_event("startup")
+def fail_interrupted_tasks_on_startup():
+    """Tasks only exist as threads of this process: after a restart, every
+    unfinished task is orphaned and would stay `inprogress` forever (#259)."""
+    tasks_api.fail_interrupted_tasks_on_startup(db.database.SessionLocal)
 
 
 #### MIDDLEWARE ####
